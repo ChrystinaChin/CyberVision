@@ -1,0 +1,48 @@
+@startuml
+skinparam sequenceMessageAlign center
+skinparam shadowing false
+skinparam ParticipantPadding 20
+
+actor "Environment" as Env
+participant "Camera (OpenCV)" as Cam
+participant "CyberVision App" as App
+participant "VLM (Moondream2)" as AI
+participant "YARA Engine" as Yara
+participant "Resource Governor" as Gov
+participant "Dashboard" as Dash
+
+== Initialization ==
+App -> AI : Initialize Model 
+App -> Gov : Start Telemetry Loop
+
+== Monitoring Loop ==
+Env -> Cam : Physical Hazard (Smoke/Fire)
+Cam -> App : Capture Frame
+App -> AI : Send Frame (Inference Request)
+activate AI
+AI -> AI : Process Pixels 
+AI --> App : Descriptive Text 
+deactivate AI
+
+== Verification & Alerting ==
+App -> Yara : Scan Text for Signatures
+activate Yara
+Yara -> Yara : Match deterministic rules
+Yara --> App : Return: VERIFIED
+deactivate Yara
+
+App -> Dash : TRIGGER ALERT NOTIFICATION
+App -> App : Save Encrypted Snapshot
+
+== Self-Healing Protocol ==
+Gov -> Gov : Check RAM/CPU (psutil)
+alt RAM Usage > 85%
+    Gov -> App : Threshold Breached
+    App -> AI : Execute Context Pruning
+    AI --> App : Memory Cleared
+    App -> Dash : Update Health Status: "Critical"
+else Stability Normal
+    App -> Dash : Update Health Status: "Normal"
+end
+
+@enduml

@@ -1,0 +1,1756 @@
+import base64
+import io
+import os
+import time
+import wave
+import socket
+import sqlite3
+import threading
+from collections import deque
+from datetime import datetime
+from typing import Any, Dict, Optional, Tuple
+
+import shutil
+import cv2
+import numpy as np
+import pandas as pd
+import psutil
+import streamlit as st
+
+# Must be the absolute first Streamlit command executed
+st.set_page_config(
+    page_title="CyberVision",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+except Exception:
+    YOLO = None
+    YOLO_AVAILABLE = False
+
+try:
+    import yara
+    YARA_AVAILABLE = True
+except Exception:
+    yara = None
+    YARA_AVAILABLE = False
+
+try:
+    import ollama
+    OLLAMA_AVAILABLE = True
+except Exception:
+    ollama = None
+    OLLAMA_AVAILABLE = False
+
+try:
+    from google.cloud import storage, firestore
+    GCP_AVAILABLE = True
+except Exception:
+    storage = None
+    firestore = None
+    GCP_AVAILABLE = False
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+CONFIG: Dict[str, Any] = {
+    "APP_NAME": "CyberVision",
+    "APP_SUBTITLE": "Adaptive Context Optimization at the Edge",
+    "VLM_MODEL": "moondream",
+    "CAMERA_INDEX": 0,
+    "CAMERA_SOURCES": [0, 1, 2, 3, 4, 5, 6, 7, 8],  # 3x3 Grid Sources
+    "FRAME_WIDTH": 640,
+    "FRAME_HEIGHT": 300,
+    "JPEG_QUALITY": 70,
+    "FRAME_DELAY_SEC": 0.22,
+    "ANALYZE_EVERY_N_FRAMES": 30, 
+    "CPU_THRESHOLD": 95,
+    "RAM_THRESHOLD": 90,
+    "ALERT_HISTORY_MAX": 100,
+    "METRICS_HISTORY_MAX": 150,
+    "LATENCY_HISTORY_MAX": 100,
+    "YARA_RULE_PATH": "hazard_rules.yar",
+    "GCP_BUCKET": "your-gcp-bucket-name",
+    "GCP_PROJECT_ID": "your-gcp-project-id",
+    "DB_FILE": "cybervision_buffer.db",
+    "YOLO_MODEL_PATH": os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "YOLO_dataset.pt",
+    ),
+    "YOLO_CONFIDENCE": 0.45,  # Slightly raised confidence to eliminate initial false alarms
+    "YOLO_IMAGE_SIZE": 320,
+}
+
+SEVERITY_STYLE = {
+    "NORMAL": {"score": 0, "icon": "✅", "color": "#30d158"},
+    "MEDIUM": {"score": 1, "icon": "🟡", "color": "#ffd60a"},
+    "HIGH": {"score": 2, "icon": "⚠️", "color": "#ff9500"},
+    "CRITICAL": {"score": 3, "icon": "🚨", "color": "#ff3b30"},
+}
+
+
+# =============================================================================
+# OFFLINE SQLITE BUFFER & GCP FIRESTORE SYNC THREAD
+# =============================================================================
+def init_db() -> None:
+    conn = sqlite3.connect(CONFIG["DB_FILE"])
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pending_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL,
+            severity TEXT,
+            description TEXT,
+            camera_id TEXT,
+            synced INTEGER DEFAULT 0
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def save_event_locally(timestamp: float, severity: str, description: str, camera_id: str = "CAM_01") -> None:
+    conn = sqlite3.connect(CONFIG["DB_FILE"])
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO pending_events (timestamp, severity, description, camera_id, synced)
+        VALUES (?, ?, ?, ?, 0)
+    """, (timestamp, severity, description, camera_id))
+    conn.commit()
+    conn.close()
+
+def is_wifi_connected(host: str = "8.8.8.8", port: int = 53, timeout: int = 2) -> bool:
+    try:
+        socket.setdefaulttimeout(timeout)
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, port))
+        return True
+    except OSError:
+        return False
+
+def sync_worker_loop() -> None:
+    while True:
+        if is_wifi_connected() and GCP_AVAILABLE and firestore is not None:
+            try:
+                db_client = firestore.Client(project=CONFIG["GCP_PROJECT_ID"])
+                conn = sqlite3.connect(CONFIG["DB_FILE"])
+                cursor = conn.cursor()
+                
+                cursor.execute("SELECT id, timestamp, severity, description, camera_id FROM pending_events WHERE synced = 0")
+                unsynced_rows = cursor.fetchall()
+
+                for row in unsynced_rows:
+                    event_id, ts, sev, desc, cam_id = row
+                    doc_ref = db_client.collection("hazard_events").document(f"event_{event_id}")
+                    doc_ref.set({
+                        "timestamp": ts,
+                        "severity": sev,
+                        "description": desc,
+                        "camera_id": cam_id,
+                        "synced_at": firestore.SERVER_TIMESTAMP
+                    })
+                    
+                    cursor.execute("UPDATE pending_events SET synced = 1 WHERE id = ?", (event_id,))
+                    conn.commit()
+                conn.close()
+            except Exception:
+                pass
+        time.sleep(10)
+
+def start_sync_thread() -> None:
+    if "sync_thread_started" not in st.session_state:
+        init_db()
+        sync_thread = threading.Thread(target=sync_worker_loop, daemon=True)
+        sync_thread.start()
+        st.session_state.sync_thread_started = True
+
+
+# =============================================================================
+# SESSION STATE
+# =============================================================================
+def init_session_state() -> None:
+    defaults = {
+        "dark_mode": False,
+        "sound_enabled": True,
+        "camera_running": False,
+        "last_frame": None,
+        "last_frame_rgb": None,
+        "frames_processed": 0,
+        "last_analyzed_frame": 0,
+        "inference_count": 0,
+        "alert_history": deque(maxlen=CONFIG["ALERT_HISTORY_MAX"]),
+        "metrics_history": deque(maxlen=CONFIG["METRICS_HISTORY_MAX"]),
+        "latency_history": deque(maxlen=CONFIG["LATENCY_HISTORY_MAX"]),
+        "system_status": "STANDBY",
+        "vlm_context": "READY",
+        "last_error": "",
+        "last_public_notice": "",
+        "cloud_sync_enabled": False,
+        "fps": 0,
+        "last_frame_time": time.time(),
+        "latest_detection": None,
+        "yolo_detector": None,
+        "yolo_detection": None,
+        "last_vlm_candidate_frame": None,
+        "latest_vlm_text": "",
+        "alarm_active": False,
+    }
+
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+@st.cache_data
+def inject_custom_css() -> None:
+    bg = "#fff7ed"
+    panel_warm = "#fff3e6"
+    text = "#1f2937"
+    muted = "#6b7280"
+    accent = "#f97316"
+    accent_dark = "#c2410c"
+    border = "#fed7aa"
+
+    st.markdown(
+        f"""
+        <style>
+        /* Force Root Viewport and App Containers to permanently stick to warm theme during script updates */
+        html, body, [data-testid="stAppViewContainer"], [data-testid="stHeader"], .stApp {{
+            background-color: {bg} !important;
+            background:
+                radial-gradient(circle at top left, rgba(249,115,22,0.18), transparent 32%),
+                linear-gradient(135deg, {bg} 0%, #ffffff 45%, #fff1e6 100%) !important;
+            color: {text} !important;
+        }}
+
+        .main .block-container {{
+            padding-top: 1.2rem;
+            padding-bottom: 2.5rem;
+            max-width: 1400px;
+        }}
+
+        div[data-baseweb="select"] {{
+            border-radius: 14px !important;
+        }}
+
+        div[data-baseweb="select"] > div {{
+            background: rgba(255,255,255,0.95) !important;
+            border: 1px solid {border} !important;
+            color: {accent_dark} !important;
+        }}
+
+        [data-testid="stSidebar"] {{
+            background: linear-gradient(180deg, #ffffff 0%, {panel_warm} 100%) !important;
+            border-right: 1px solid {border};
+        }}
+
+        [data-testid="stSidebar"] h1,
+        [data-testid="stSidebar"] h2,
+        [data-testid="stSidebar"] h3 {{
+            color: {accent_dark} !important;
+            font-weight: 900 !important;
+        }}
+
+        h1, h2, h3, h4, h5, h6, p, label, span {{
+            color: {text};
+        }}
+
+        .muted {{
+            color: {muted};
+        }}
+
+        .hero {{
+            position: relative;
+            padding: 0.8rem 1.2rem;
+            background:
+                linear-gradient(135deg, rgba(255,255,255,0.96), rgba(255,237,213,0.96)),
+                radial-gradient(circle at top right, rgba(249,115,22,0.28), transparent 35%);
+            border: 1px solid {border};
+            border-radius: 26px;
+            margin-bottom: 1.2rem;
+            box-shadow: 0 14px 36px rgba(249,115,22,0.13);
+            overflow: hidden;
+        }}
+
+        .hero-title {{
+            font-size: 2.25rem;
+            font-weight: 900;
+            margin: 0.35rem 0 0 0;
+            color: {accent_dark};
+            letter-spacing: -0.04em;
+        }}
+
+        .pill {{
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.35rem 0.8rem;
+            border-radius: 999px;
+            background: rgba(249,115,22,0.12);
+            border: 1px solid rgba(249,115,22,0.35);
+            color: {accent_dark};
+            font-weight: 900;
+            font-size: 0.78rem;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }}
+
+        .status-card {{
+            padding: 1.3rem;
+            background: rgba(255,255,255,0.94);
+            border: 1px solid {border};
+            border-radius: 24px;
+            box-shadow: 0 12px 30px rgba(249,115,22,0.12);
+            margin-bottom: 1rem;
+        }}
+
+        div[data-testid="stMetric"] {{
+            background: rgba(255,255,255,0.94);
+            border: 1px solid {border};
+            border-radius: 14px;
+            padding: 0.25rem 0.5rem;
+            min-height: 65px;
+            box-shadow: 0 8px 18px rgba(249,115,22,0.08);
+        }}
+
+        div[data-testid="stMetricValue"] {{
+            color: {accent_dark};
+            font-weight: 900;
+            font-size: 1.25rem !important;
+        }}
+
+        .stButton > button {{
+            border-radius: 14px;
+            font-weight: 800;
+            border: 1px solid #fb923c;
+            background: linear-gradient(135deg, #fff7ed, #ffedd5);
+            color: {accent_dark};
+            box-shadow: 0 8px 18px rgba(249,115,22,0.12);
+            transition: all 0.18s ease-in-out;
+        }}
+
+        .stButton > button:hover {{
+            background: linear-gradient(135deg, #fed7aa, #fdba74);
+            color: #7c2d12;
+            border-color: {accent};
+            transform: translateY(-1px);
+        }}
+
+        @keyframes fadeIn {{
+            from {{ opacity: 0; transform: translateY(-10px); }}
+            to {{ opacity: 1; transform: translateY(0); }}
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+def apply_theme() -> None:
+    inject_custom_css()
+
+
+# =============================================================================
+# ALERT SOUND
+# =============================================================================
+def build_beep_wav_base64(
+    duration: float = 0.35,
+    freq: int = 950,
+    sample_rate: int = 44100
+) -> str:
+    t = np.linspace(0, duration, int(sample_rate * duration), False)
+    tone = np.sin(freq * t * 2 * np.pi)
+    envelope = np.linspace(1, 0.15, tone.size)
+    audio = (tone * envelope * 32767).astype(np.int16)
+
+    buffer = io.BytesIO()
+
+    with wave.open(buffer, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(audio.tobytes())
+
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
+def play_alert_sound(
+    loop: bool = False,
+    stop: bool = False
+) -> None:
+
+    if stop:
+        st.components.v1.html(
+            """
+            <script>
+            window.cybervisionAudioPlayers =
+                window.cybervisionAudioPlayers || [];
+
+            window.cybervisionAudioPlayers.forEach(audio => {
+                audio.pause();
+                audio.currentTime = 0;
+            });
+
+            window.cybervisionAudioPlayers = [];
+            </script>
+            """,
+            height=0,
+        )
+        return
+
+    if not st.session_state.sound_enabled:
+        return
+
+    audio_b64 = build_beep_wav_base64(
+        duration=0.45 if loop else 0.35,
+        freq=1100 if loop else 950,
+    )
+
+    st.components.v1.html(
+        f"""
+        <script>
+        window.cybervisionAudioPlayers =
+            window.cybervisionAudioPlayers || [];
+
+        const audio = new Audio(
+            "data:audio/wav;base64,{audio_b64}"
+        );
+
+        audio.volume = 1.0;
+        audio.loop = {"true" if loop else "false"};
+
+        window.cybervisionAudioPlayers.push(audio);
+
+        audio.play().catch(() => {{}});
+        </script>
+        """,
+        height=0,
+    )
+
+
+# =============================================================================
+# SYSTEM MONITORING
+# =============================================================================
+class SystemMonitor:
+    @staticmethod
+    def get_metrics() -> Dict[str, Any]:
+        try:
+            cpu = float(psutil.cpu_percent(interval=0.03))
+            ram = float(psutil.virtual_memory().percent)
+
+            metrics = {
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "cpu": cpu,
+                "ram": ram,
+            }
+
+            st.session_state.metrics_history.append(metrics)
+            return metrics
+
+        except Exception:
+            return {
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "cpu": 0.0,
+                "ram": 0.0,
+            }
+
+
+class ResourceGovernor:
+    @staticmethod
+    def check_resource_pressure() -> None:
+        metrics = SystemMonitor.get_metrics()
+        cpu = metrics["cpu"]
+        ram = metrics["ram"]
+
+        if cpu >= CONFIG["CPU_THRESHOLD"] or ram >= CONFIG["RAM_THRESHOLD"]:
+            st.session_state.system_status = "RESOURCE_PRESSURE"
+            st.session_state.vlm_context = "REDUCED"
+            st.session_state.last_public_notice = (
+                f"Resource pressure detected. CPU={cpu:.1f}%, RAM={ram:.1f}%. "
+                "Using reduced context."
+            )
+        else:
+            st.session_state.system_status = "HEALTHY"
+            st.session_state.vlm_context = "ACTIVE"
+            st.session_state.last_public_notice = ""
+
+    @staticmethod
+    def recommended_token_budget() -> int:
+        metrics = SystemMonitor.get_metrics()
+        worst = max(metrics["cpu"], metrics["ram"])
+
+        if worst >= 85:
+            return 128
+        if worst >= 70:
+            return 256
+        if worst >= 50:
+            return 512
+
+        return 1024
+
+
+# =============================================================================
+# MULTI-CAMERA HANDLING & 3x3 MATRIX
+# =============================================================================
+@st.cache_resource(show_spinner=False)
+def get_camera_caps() -> Dict[int, cv2.VideoCapture]:
+    caps = {}
+    for idx, src in enumerate(CONFIG["CAMERA_SOURCES"]):
+        cap = cv2.VideoCapture(src)
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            caps[idx] = cap
+        else:
+            cap.release()
+    return caps
+
+
+def release_camera() -> None:
+    try:
+        caps = get_camera_caps()
+        for cap in caps.values():
+            if cap and cap.isOpened():
+                cap.release()
+        get_camera_caps.clear()
+    except Exception:
+        pass
+
+
+def create_blank_tile(width: int = 320, height: int = 240, label: str = "NO CAMERA DETECTED") -> np.ndarray:
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    text_size = cv2.getTextSize(label, font, 0.45, 1)[0]
+    text_x = (width - text_size[0]) // 2
+    text_y = (height + text_size[1]) // 2
+    
+    cv2.putText(frame, label, (text_x, text_y), font, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
+    cv2.rectangle(frame, (0, 0), (width - 1, height - 1), (40, 40, 40), 1)
+    return frame
+
+
+def construct_3x3_grid(active_frames: Dict[int, np.ndarray], tile_w: int = 320, tile_h: int = 240) -> np.ndarray:
+    tiles = []
+    for idx in range(9):
+        cam_key = f"CAM_{idx+1:02d}"
+        if idx in active_frames and active_frames[idx] is not None:
+            tile = cv2.resize(active_frames[idx], (tile_w, tile_h))
+            cv2.putText(tile, f"{cam_key} [LIVE]", (10, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+            cv2.rectangle(tile, (0, 0), (tile_w - 1, tile_h - 1), (0, 255, 0), 1)
+        else:
+            tile = create_blank_tile(tile_w, tile_h, label=f"{cam_key}: NO CAMERA DETECTED")
+        tiles.append(tile)
+
+    row1 = np.hstack([tiles[0], tiles[1], tiles[2]])
+    row2 = np.hstack([tiles[3], tiles[4], tiles[5]])
+    row3 = np.hstack([tiles[6], tiles[7], tiles[8]])
+
+    return np.vstack([row1, row2, row3])
+
+
+class VideoCaptureManager:
+    @staticmethod
+    def capture_active_frames() -> Tuple[Dict[int, np.ndarray], Optional[np.ndarray]]:
+        caps = get_camera_caps()
+        active_frames = {}
+        primary_frame = None
+
+        if not caps:
+            st.session_state.last_error = "No camera streams open."
+            return {}, None
+
+        for idx, cap in list(caps.items()):
+            if cap.isOpened():
+                for _ in range(2):
+                    cap.grab()
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    active_frames[idx] = frame
+                    if primary_frame is None:
+                        primary_frame = cv2.resize(frame, (CONFIG["FRAME_WIDTH"], CONFIG["FRAME_HEIGHT"]))
+
+        return active_frames, primary_frame
+
+    @staticmethod
+    def placeholder_frame(message: str, subtext: str = "") -> np.ndarray:
+        frame = np.zeros(
+            (CONFIG["FRAME_HEIGHT"], CONFIG["FRAME_WIDTH"], 3),
+            dtype=np.uint8
+        )
+
+        frame[:] = (22, 28, 55)
+
+        cv2.putText(
+            frame,
+            message,
+            (55, 220),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 255, 170),
+            2,
+        )
+
+        if subtext:
+            cv2.putText(
+                frame,
+                subtext,
+                (55, 265),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (220, 220, 220),
+                1,
+            )
+
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+
+# =============================================================================
+# IMAGE ENCODING
+# =============================================================================
+def frame_to_base64_jpeg(frame: np.ndarray) -> str:
+    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), CONFIG["JPEG_QUALITY"]]
+    ok, buffer = cv2.imencode(".jpg", frame, encode_param)
+
+    if not ok:
+        raise ValueError("Failed to encode frame.")
+
+    return base64.b64encode(buffer).decode("utf-8")
+
+
+# =============================================================================
+# YOLO FIRE & SMOKE DETECTION
+# =============================================================================
+@st.cache_resource(show_spinner=False)
+def load_yolo_model():
+    if not YOLO_AVAILABLE:
+        return None
+
+    model_path = CONFIG["YOLO_MODEL_PATH"]
+
+    if not os.path.exists(model_path):
+        return None
+
+    try:
+        return YOLO(model_path)
+    except Exception:
+        return None
+
+def is_yolo_model_available() -> bool:
+    if not YOLO_AVAILABLE:
+        return False
+
+    model_path = CONFIG["YOLO_MODEL_PATH"]
+
+    if not os.path.isfile(model_path):
+        return False
+
+    return load_yolo_model() is not None
+
+
+class YOLOFireSmokeDetector:
+    def __init__(self) -> None:
+        self.model = load_yolo_model()
+
+    @property
+    def available(self) -> bool:
+        return self.model is not None
+
+    def detect(self, frame: np.ndarray) -> Dict[str, Any]:
+        empty = {
+            "detected": False,
+            "detections": [],
+            "highest_confidence": 0.0,
+            "classes": [],
+            "annotated_frame": frame,
+        }
+
+        if frame is None or self.model is None:
+            return empty
+
+        try:
+            results = self.model(
+                frame,
+                imgsz=CONFIG["YOLO_IMAGE_SIZE"],
+                conf=CONFIG["YOLO_CONFIDENCE"],
+                verbose=False,
+            )
+
+            if not results:
+                return empty
+
+            result = results[0]
+            detections = []
+            names = result.names if hasattr(result, "names") else self.model.names
+
+            if result.boxes is not None:
+                for box in result.boxes:
+                    cls_id = int(box.cls[0].item())
+                    confidence = float(box.conf[0].item())
+
+                    if isinstance(names, dict):
+                        class_name = str(names.get(cls_id, cls_id)).lower()
+                    else:
+                        class_name = str(names[cls_id]).lower()
+
+                    xyxy = box.xyxy[0].tolist()
+
+                    detections.append({
+                        "class": class_name,
+                        "confidence": confidence,
+                        "box": [int(v) for v in xyxy],
+                    })
+
+            annotated = result.plot() if detections else frame
+
+            return {
+                "detected": bool(detections),
+                "detections": detections,
+                "highest_confidence": (
+                    max(d["confidence"] for d in detections)
+                    if detections else 0.0
+                ),
+                "classes": sorted(set(d["class"] for d in detections)),
+                "annotated_frame": annotated,
+            }
+
+        except Exception as exc:
+            st.session_state.last_error = f"YOLO detection issue: {exc}"
+            return empty
+
+    @staticmethod
+    def hazard_severity(yolo_result: Dict[str, Any]) -> str:
+        if not yolo_result.get("detected"):
+            return "NORMAL"
+
+        highest = "NORMAL"
+
+        for detection in yolo_result.get("detections", []):
+            class_name = detection["class"].lower()
+            confidence = detection["confidence"]
+
+            if "fire" in class_name:
+                candidate = "CRITICAL" if confidence >= 0.82 else "HIGH"
+            elif "smoke" in class_name:
+                candidate = "HIGH" if confidence >= 0.82 else "MEDIUM"
+            else:
+                continue
+
+            if SEVERITY_STYLE[candidate]["score"] > SEVERITY_STYLE[highest]["score"]:
+                highest = candidate
+
+        return highest
+
+
+# =============================================================================
+# VISUAL FALLBACK DETECTION (TIGHTENED TO ELIMINATE FALSE CRITICAL ALERTS)
+# =============================================================================
+class VisualFireSmokeDetector:
+    @staticmethod
+    def detect(frame: np.ndarray) -> Dict[str, Any]:
+        if frame is None or frame.size == 0:
+            return {
+                "visual_severity": "NORMAL",
+                "visual_keyword": "",
+                "fire_ratio": 0.0,
+                "smoke_ratio": 0.0,
+            }
+
+        bgr = frame
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+
+        b, g, r = cv2.split(bgr)
+        h, s, v = cv2.split(hsv)
+
+        # Skin tone filtering
+        lower_skin = np.array([0, 133, 77], dtype=np.uint8)
+        upper_skin = np.array([255, 173, 127], dtype=np.uint8)
+        skin_mask = cv2.inRange(ycrcb, lower_skin, upper_skin)
+
+        # Stricter Fire HSV Range to prevent ambient room lights / warm skin triggering CRITICAL
+        red_or_orange_hue = ((h <= 18) | (h >= 172))
+        bright_saturated = (s >= 160) & (v >= 200)
+        rgb_dominance = (r > 190) & (r > g * 1.25) & (r > b * 1.85) & (g > 60)
+        non_skin = skin_mask == 0
+
+        fire_pixels = red_or_orange_hue & bright_saturated & rgb_dominance & non_skin
+        fire_mask = fire_pixels.astype(np.uint8) * 255
+
+        kernel = np.ones((5, 5), np.uint8)
+        fire_mask = cv2.morphologyEx(fire_mask, cv2.MORPH_OPEN, kernel)
+        fire_mask = cv2.morphologyEx(fire_mask, cv2.MORPH_DILATE, kernel)
+
+        # Stricter Smoke Detection
+        low_saturation = s < 35
+        mid_brightness = (v > 110) & (v < 200)
+        gray_dominance = (
+            (np.abs(r.astype(int) - g.astype(int)) < 18)
+            & (np.abs(g.astype(int) - b.astype(int)) < 18)
+        )
+
+        smoke_pixels = low_saturation & mid_brightness & gray_dominance
+        smoke_mask = smoke_pixels.astype(np.uint8) * 255
+
+        total_pixels = frame.shape[0] * frame.shape[1]
+
+        fire_ratio = float(cv2.countNonZero(fire_mask)) / total_pixels
+        smoke_ratio = float(cv2.countNonZero(smoke_mask)) / total_pixels
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            fire_mask,
+            connectivity=8,
+        )
+
+        largest_fire_area = 0
+        if num_labels > 1:
+            largest_fire_area = int(stats[1:, cv2.CC_STAT_AREA].max())
+
+        largest_fire_ratio = largest_fire_area / total_pixels
+
+        keyword = ""
+
+        # Tightened thresholds: Visual fallback defaults to lower confidence without YOLO/VLM
+        if fire_ratio >= 0.050 and largest_fire_ratio >= 0.040:
+            severity = "CRITICAL"
+            keyword = "visual_fire_critical"
+
+        elif fire_ratio >= 0.025 and largest_fire_ratio >= 0.020:
+            severity = "HIGH"
+            keyword = "visual_fire_high"
+
+        elif fire_ratio >= 0.010:
+            severity = "MEDIUM"
+            keyword = "visual_fire_medium"
+
+        elif smoke_ratio >= 0.35:
+            severity = "CRITICAL"
+            keyword = "visual_smoke_critical"
+
+        elif smoke_ratio >= 0.20:
+            severity = "HIGH"
+            keyword = "visual_smoke_high"
+
+        elif smoke_ratio >= 0.10:
+            severity = "MEDIUM"
+            keyword = "visual_smoke_medium"
+
+        else:
+            severity = "NORMAL"
+            keyword = ""
+
+        return {
+            "visual_severity": severity,
+            "visual_keyword": keyword,
+            "fire_ratio": fire_ratio,
+            "smoke_ratio": smoke_ratio,
+        }
+
+
+# =============================================================================
+# OLLAMA VLM INFERENCE
+# =============================================================================
+class VLMInference:
+    @staticmethod
+    def run_inference(frame: np.ndarray) -> Tuple[str, bool]:
+        if not OLLAMA_AVAILABLE:
+            st.session_state.last_error = "Ollama Python package is not installed."
+            return "NORMAL: VLM unavailable. No text-based hazard confirmed.", False
+
+        try:
+            token_budget = ResourceGovernor.recommended_token_budget()
+            image_b64 = frame_to_base64_jpeg(frame)
+
+            response = ollama.chat(
+                model=CONFIG["VLM_MODEL"],
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            "Analyze this camera frame for fire and smoke only. "
+                            "Return exactly one category: NORMAL, MEDIUM, HIGH, or CRITICAL. "
+                            "Use NORMAL when there is no visible fire or smoke. "
+                            "Use MEDIUM only for light smoke or unclear early warning. "
+                            "Use HIGH for visible flame, burning object, or clear smoke. "
+                            "Use CRITICAL only for active fire, heavy smoke, visible flames, explosion, or immediate danger. "
+                            "Do not classify people, skin, red clothing, walls, posters, or warm lighting as fire. "
+                            "Start with the category, then one short reason."
+                        ),
+                        "images": [image_b64],
+                    }
+                ],
+                options={
+                    "num_ctx": token_budget,
+                    "num_predict": 80,
+                    "temperature": 0.0,
+                },
+            )
+
+            text = response.get("message", {}).get("content", "").strip()
+
+            if not text:
+                st.session_state.last_error = "Ollama returned an empty response."
+                return "NORMAL: VLM returned no confirmed fire or smoke.", False
+
+            st.session_state.inference_count += 1
+            st.session_state.last_error = ""
+            return text, True
+
+        except Exception as exc:
+            st.session_state.last_error = f"Ollama backend issue: {exc}"
+            return (
+                "NORMAL: VLM temporarily unavailable. "
+                "No text-based fire or smoke confirmed."
+            ), False
+
+
+# =============================================================================
+# YARA VERIFICATION
+# =============================================================================
+@st.cache_resource(show_spinner=False)
+def compile_yara_rules():
+    if not YARA_AVAILABLE:
+        return None
+
+    if not os.path.exists(CONFIG["YARA_RULE_PATH"]):
+        st.session_state.last_error = "hazard_rules.yar not found."
+        return None
+
+    return yara.compile(filepath=CONFIG["YARA_RULE_PATH"])
+
+
+class YARAVerifier:
+    @staticmethod
+    def verify(vlm_text: str, visual_result: Dict[str, Any]) -> Dict[str, Any]:
+        yara_severity = "NORMAL"
+        matched_rule = "no_yara_match"
+        matched_source = "YARA_TEXT"
+
+        if YARA_AVAILABLE:
+            try:
+                rules = compile_yara_rules()
+
+                if rules:
+                    matches = rules.match(
+                        data=vlm_text.encode("utf-8", errors="ignore")
+                    )
+                else:
+                    matches = []
+
+                if matches:
+                    highest_score = -1
+
+                    for match in matches:
+                        severity = match.meta.get("severity", "NORMAL")
+                        score = SEVERITY_STYLE.get(
+                            severity,
+                            SEVERITY_STYLE["NORMAL"]
+                        )["score"]
+
+                        if score > highest_score:
+                            highest_score = score
+                            yara_severity = severity
+                            matched_rule = match.rule
+
+            except Exception:
+                yara_severity = "NORMAL"
+                matched_rule = "yara_verification_unavailable"
+
+        else:
+            matched_rule = "yara_not_installed"
+
+        visual_severity = visual_result.get("visual_severity", "NORMAL")
+
+        yara_score = SEVERITY_STYLE[yara_severity]["score"]
+        visual_score = SEVERITY_STYLE[visual_severity]["score"]
+
+        if visual_score > yara_score:
+            final_severity = visual_severity
+            matched_source = "OPENCV_VISUAL_FALLBACK"
+            matched_keyword = visual_result.get("visual_keyword", "visual_detection")
+        else:
+            final_severity = yara_severity
+            matched_keyword = matched_rule
+
+        is_hazard = final_severity != "NORMAL"
+
+        confidence = {
+            "NORMAL": 0.10,
+            "MEDIUM": 0.64,
+            "HIGH": 0.82,
+            "CRITICAL": 0.92,
+        }[final_severity]
+
+        return {
+            "severity": final_severity,
+            "is_hazard": is_hazard,
+            "confidence": confidence,
+            "matched_keyword": matched_keyword,
+            "matched_source": matched_source,
+            "yara_severity": yara_severity,
+            "visual_severity": visual_severity,
+            "fire_ratio": visual_result.get("fire_ratio", 0.0),
+            "smoke_ratio": visual_result.get("smoke_ratio", 0.0),
+            "yara_available": YARA_AVAILABLE,
+        }
+
+
+# =============================================================================
+# GOOGLE CLOUD FORENSIC BACKUP & LOCAL BUFFER
+# =============================================================================
+def upload_to_google_cloud(frame: np.ndarray, alert: Dict[str, Any]) -> None:
+    save_event_locally(
+        time.time(),
+        alert.get("severity", "UNKNOWN"),
+        alert.get("description", ""),
+        camera_id="CAM_01"
+    )
+
+    if not st.session_state.cloud_sync_enabled:
+        return
+
+    if not GCP_AVAILABLE or storage is None:
+        return
+
+    if CONFIG["GCP_BUCKET"] == "your-gcp-bucket-name":
+        return
+
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        severity = alert.get("severity", "UNKNOWN")
+
+        image_name = f"cybervision_alerts/{severity}_{timestamp}.jpg"
+        log_name = f"cybervision_alerts/{severity}_{timestamp}.json"
+
+        ok, buffer = cv2.imencode(".jpg", frame)
+
+        if not ok:
+            return
+
+        client = storage.Client()
+        bucket = client.bucket(CONFIG["GCP_BUCKET"])
+
+        image_blob = bucket.blob(image_name)
+        image_blob.upload_from_string(
+            buffer.tobytes(),
+            content_type="image/jpeg",
+        )
+
+        log_blob = bucket.blob(log_name)
+        log_blob.upload_from_string(
+            str(alert),
+            content_type="application/json",
+        )
+
+    except Exception:
+        pass
+
+
+# =============================================================================
+# DETECTION PIPELINE
+# =============================================================================
+def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
+    if frame is None or frame.size == 0:
+        default_alert = {
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "description": "NORMAL: Camera stream starting...",
+            "success": True,
+            "latency": 0.0,
+            "verified": False,
+            "yolo_detected": False,
+            "yolo_classes": "",
+            "yolo_confidence": 0.0,
+            "severity": "NORMAL",
+            "is_hazard": False,
+            "confidence": 0.0,
+            "matched_keyword": "none",
+            "matched_source": "SYSTEM",
+            "yara_severity": "NORMAL",
+            "visual_severity": "NORMAL",
+            "fire_ratio": 0.0,
+            "smoke_ratio": 0.0,
+            "yara_available": YARA_AVAILABLE,
+        }
+        return {
+            "annotated_frame": frame,
+            "yolo": {"detected": False, "detections": []},
+            "alert": default_alert,
+        }
+
+    ResourceGovernor.check_resource_pressure()
+    start_time = time.time()
+
+    visual_result = VisualFireSmokeDetector.detect(frame)
+
+    yolo_detector = st.session_state.get("yolo_detector")
+
+    if yolo_detector is None:
+        yolo_detector = YOLOFireSmokeDetector()
+        st.session_state.yolo_detector = yolo_detector
+
+    yolo_result = yolo_detector.detect(frame)
+    st.session_state.yolo_detection = yolo_result
+
+    yolo_severity = yolo_detector.hazard_severity(yolo_result)
+
+    if SEVERITY_STYLE[yolo_severity]["score"] > SEVERITY_STYLE[
+        visual_result["visual_severity"]
+    ]["score"]:
+        visual_result["visual_severity"] = yolo_severity
+
+        if yolo_result.get("detections"):
+            first = yolo_result["detections"][0]
+            visual_result["visual_keyword"] = (
+                f"yolo_{first['class']}_{first['confidence']:.2f}"
+            )
+
+    candidate_hazard = (
+        yolo_result.get("detected", False)
+        or visual_result.get("visual_severity", "NORMAL") != "NORMAL"
+    )
+
+    frame_number = st.session_state.frames_processed
+    analyze_this_frame = (
+        candidate_hazard
+        and frame_number % max(1, CONFIG["ANALYZE_EVERY_N_FRAMES"]) == 0
+    )
+
+    if candidate_hazard and st.session_state.get("last_vlm_candidate_frame") is None:
+        analyze_this_frame = True
+
+    if analyze_this_frame:
+        vlm_text, vlm_success = VLMInference.run_inference(frame)
+        st.session_state.last_vlm_candidate_frame = frame_number
+    elif candidate_hazard:
+        previous = st.session_state.get("latest_vlm_text", "")
+        vlm_text = previous or "NORMAL: Waiting for VLM confirmation."
+        vlm_success = bool(previous)
+    else:
+        vlm_text = "NORMAL: YOLO detected no fire or smoke candidate."
+        vlm_success = True
+
+    st.session_state.latest_vlm_text = vlm_text
+
+    verdict = YARAVerifier.verify(vlm_text, visual_result)
+
+    latency = time.time() - start_time
+    st.session_state.latency_history.append(latency)
+
+    public_description = vlm_text
+
+    if yolo_result.get("detected"):
+        detection_text = ", ".join(
+            f"{d['class']} {d['confidence']:.0%}"
+            for d in yolo_result["detections"]
+        )
+
+        if not vlm_success or not analyze_this_frame:
+            public_description = (
+                f"YOLO detected: {detection_text}. "
+                f"VLM confirmation: {vlm_text}"
+            )
+
+    if not vlm_success and verdict["severity"] == "NORMAL":
+        public_description = (
+            "VLM temporarily unavailable. "
+            "No confirmed fire or smoke detected from fallback analysis."
+        )
+
+    alert = {
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+        "description": public_description,
+        "success": vlm_success,
+        "latency": latency,
+        "verified": verdict["is_hazard"],
+        "yolo_detected": yolo_result.get("detected", False),
+        "yolo_classes": ", ".join(yolo_result.get("classes", [])),
+        "yolo_confidence": yolo_result.get("highest_confidence", 0.0),
+        **verdict,
+    }
+
+    st.session_state.alert_history.append(alert)
+    st.session_state.latest_detection = alert
+
+    if verdict["is_hazard"]:
+        if verdict["severity"] == "CRITICAL":
+            if not st.session_state.get("alarm_active", False):
+                play_alert_sound(loop=True)
+                st.session_state.alarm_active = True
+        else:
+            play_alert_sound(loop=False)
+            st.session_state.alarm_active = False
+
+        upload_to_google_cloud(frame, alert)
+
+    else:
+        if st.session_state.get("alarm_active", False):
+            play_alert_sound(stop=True)
+            st.session_state.alarm_active = False
+
+    return {
+        "annotated_frame": yolo_result.get("annotated_frame", frame),
+        "yolo": yolo_result,
+        "alert": alert,
+    }
+
+
+# =============================================================================
+# SIDEBAR
+# =============================================================================
+def render_sidebar() -> None:
+    with st.sidebar:
+        st.markdown("## Control Center")
+
+        if st.session_state.camera_running:
+            st.success("🟢 Camera running")
+        else:
+            st.warning("🔴 Camera stopped")
+
+        st.session_state.sound_enabled = st.toggle(
+            "Alert sound",
+            value=st.session_state.sound_enabled,
+        )
+
+        st.session_state.cloud_sync_enabled = st.toggle(
+            "Sync Data",
+            value=st.session_state.cloud_sync_enabled,
+        )
+
+        wifi_online = is_wifi_connected()
+        net_text = "Connected" if wifi_online else "Offline"
+        net_color = "#30d158" if wifi_online else "#ffd60a"
+        st.markdown(f"*Network:* <span style='color:{net_color}; font-weight:bold;'>{net_text}</span>", unsafe_allow_html=True)
+
+        st.markdown(" ")
+        
+
+        timeout_option = st.selectbox(
+            "Inference timeout target",
+            ["1.0s", "2.0s", "3.0s", "5.0s"],
+            index=1,
+            key="inference_timeout_select"
+        )
+
+        CONFIG["INFERENCE_TIMEOUT"] = float(
+            timeout_option.replace("s", "")
+        )
+        st.markdown(" ")
+        st.markdown("## Resources")
+
+        metrics = SystemMonitor.get_metrics()
+
+        cpu_delta = (
+            "🟢"
+            if metrics["cpu"] < 70
+            else "🟡"
+            if metrics["cpu"] < CONFIG["CPU_THRESHOLD"]
+            else "🔴"
+        )
+
+        ram_delta = (
+            "🟢"
+            if metrics["ram"] < 70
+            else "🟡"
+            if metrics["ram"] < CONFIG["RAM_THRESHOLD"]
+            else "🔴"
+        )
+
+        st.metric("CPU", f"{metrics['cpu']:.1f}%", cpu_delta)
+        st.metric("RAM", f"{metrics['ram']:.1f}%", ram_delta)
+        st.metric("Token Budget", ResourceGovernor.recommended_token_budget())
+
+        if st.session_state.latency_history:
+            avg_latency = (
+                sum(st.session_state.latency_history)
+                / len(st.session_state.latency_history)
+            )
+            st.metric("Avg Latency", f"{avg_latency * 1000:.0f} ms")
+        else:
+            st.metric("Avg Latency", "—")
+
+        if st.button("Reset logs", use_container_width=True, key="reset_logs_btn"):
+            st.session_state.alert_history.clear()
+            st.session_state.latency_history.clear()
+            st.session_state.latest_detection = None
+            st.success("Logs reset.")
+
+        if st.session_state.last_error:
+            st.info("Model/YARA backend is not fully available. Visual fallback remains active.")
+
+
+# =============================================================================
+# DASHBOARD COMPONENTS
+# =============================================================================
+def get_latest_alert() -> Optional[Dict[str, Any]]:
+    if not st.session_state.alert_history:
+        return None
+
+    return st.session_state.alert_history[-1]
+
+
+def render_status_cards() -> None:
+    latest = st.session_state.get("latest_detection") or {}
+
+    severity = latest.get("severity", "NORMAL")
+
+    total = len(st.session_state.alert_history)
+    hazards = sum(
+        1 for item in st.session_state.alert_history
+        if item["is_hazard"]
+    )
+
+    confidence = (
+        latest.get("confidence", 0) * 100
+        if latest
+        else 0
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
+        "Current Severity",
+        f"{severity}"
+    )
+
+    c2.metric(
+        "Frames Processed",
+        st.session_state.frames_processed
+    )
+
+    c3.metric(
+        "Confidence",
+        f"{confidence:.0f}%"
+    )
+
+    c4.metric(
+        "Hazards",
+        hazards,
+        f"of {total} events"
+    )
+
+def determine_hazard_title(latest: Dict[str, Any]) -> str:
+    if not latest or latest.get("severity") == "NORMAL":
+        return "Environment is Safe"
+
+    classes = [c.lower() for c in latest.get("yolo_classes", "").split(",") if c.strip()]
+    description = latest.get("description", "").lower()
+    keyword = str(latest.get("matched_keyword", "")).lower()
+
+    has_fire = any("fire" in item for item in classes) or "fire" in description or "fire" in keyword
+    has_smoke = any("smoke" in item for item in classes) or "smoke" in description or "smoke" in keyword
+
+    if latest.get("fire_ratio", 0) > 0.010:
+        has_fire = True
+    if latest.get("smoke_ratio", 0) > 0.10:
+        has_smoke = True
+
+    if has_fire and has_smoke:
+        return "Fire & Smoke Detected"
+    elif has_fire:
+        return "Fire Detected"
+    elif has_smoke:
+        return "Smoke Detected"
+    else:
+        return "Fire or Smoke Detected"
+
+
+def render_alert_center() -> None:
+    st.markdown("### Alerts")
+
+    latest = get_latest_alert()
+
+    if latest and latest.get("severity") != "NORMAL":
+        color = SEVERITY_STYLE[latest["severity"]]["color"]
+        hazard_label = determine_hazard_title(latest)
+
+        st.markdown(
+            f"""
+            <div style="
+            position:fixed;
+            top:20px;
+            right:20px;
+            z-index:999999;
+            background:{color};
+            color:white;
+            padding:12px 20px;
+            border-radius:12px;
+            font-weight:bold;
+            box-shadow:0 8px 20px rgba(0,0,0,.3);
+            animation: fadeIn 0.3s ease;
+            ">
+            <span style="font-size: 0.8rem; text-transform: uppercase; opacity: 0.9;">{latest['severity']}</span><br>
+            <span style="font-size: 1.1rem;">{hazard_label}</span>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+    if not latest:
+        st.info("Waiting for analysed frame...")
+        return
+
+    severity = latest["severity"]
+    style = SEVERITY_STYLE[severity]
+
+    if severity == "NORMAL":
+        title = "Environment is Safe"
+        user_message = "No fire or smoke detected."
+        action_message = "No action is required."
+    else:
+        title = determine_hazard_title(latest)
+        if "Fire" in title and "Smoke" in title:
+            user_message = "The system detected clear active signs of both fire and smoke."
+            action_message = "Please check the area immediately and prepare to evacuate."
+        elif "Fire" in title:
+            user_message = "The system detected clear signs of active fire."
+            action_message = "Please check the area immediately and prepare to evacuate."
+        elif "Smoke" in title:
+            user_message = "The system detected clear signs of smoke or early burning."
+            action_message = "Please inspect the area carefully for smoke sources."
+        else:
+            user_message = "The system detected clear hazard signs."
+            action_message = "Please check the area immediately."
+
+    st.markdown(
+        f"""
+    <div class="status-card"
+        style="border-left:10px solid {style['color']};">
+
+    <h1>{style['icon']} {severity}</h1>
+
+    <h3>{title}</h3>
+
+    <p>{user_message}</p>
+
+    <p style="font-weight:bold;color:#c2410c;">
+    {action_message}
+    </p>
+
+    <p class="muted">
+    Last checked: {latest['timestamp']}
+    </p>
+
+    </div>
+    """,
+        unsafe_allow_html=True,
+    )
+
+
+# =============================================================================
+# LIVE VIDEO STREAM (3x3 MATRIX)
+# =============================================================================
+def render_video_frame(video_placeholder, status_placeholder) -> None:
+    if not st.session_state.get("camera_running", False):
+        if st.session_state.get("last_frame_rgb") is not None:
+            video_placeholder.image(
+                st.session_state.last_frame_rgb,
+                use_container_width=True,
+            )
+        else:
+            video_placeholder.image(
+                VideoCaptureManager.placeholder_frame(
+                    "Camera Stopped",
+                    "Click Start to begin monitoring.",
+                ),
+                use_container_width=True,
+            )
+
+        status_placeholder.info("Camera is stopped. Detection paused.")
+        return
+
+    active_frames, primary_frame = VideoCaptureManager.capture_active_frames()
+
+    if primary_frame is None and not active_frames:
+        status_placeholder.error("Camera unavailable.")
+        return
+
+    current_time = time.time()
+    last_time = st.session_state.get("last_frame_time", current_time)
+    fps = 1 / max(current_time - last_time, 0.001)
+
+    st.session_state.fps = fps
+    st.session_state.last_frame_time = current_time
+    st.session_state.frames_processed += 1
+
+    pipeline_result = run_detection_pipeline(primary_frame)
+    
+    if 0 in active_frames and pipeline_result.get("annotated_frame") is not None:
+        active_frames[0] = pipeline_result["annotated_frame"]
+
+    grid_matrix = construct_3x3_grid(active_frames)
+
+    latest = st.session_state.get("latest_detection") or {}
+    severity = latest.get("severity", "NORMAL")
+
+    yolo_result = pipeline_result.get("yolo", {})
+    yolo_status = "DETECTED" if yolo_result.get("detected") else "CLEAR"
+
+    hud_line_1 = f"FPS: {fps:.1f} | YOLO: {yolo_status}"
+    hud_line_2 = (
+        f"INF: {st.session_state.get('inference_count', 0)} | "
+        f"STATUS: {severity}"
+    )
+
+    overlay = grid_matrix.copy()
+    cv2.rectangle(overlay, (10, 10), (430, 82), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.50, grid_matrix, 0.50, 0, grid_matrix)
+
+    cv2.putText(
+        grid_matrix,
+        hud_line_1,
+        (20, 38),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.50,
+        (0, 255, 0),
+        2,
+    )
+
+    cv2.putText(
+        grid_matrix,
+        hud_line_2,
+        (20, 65),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.50,
+        (0, 255, 0),
+        2,
+    )
+
+    grid_rgb = cv2.cvtColor(grid_matrix, cv2.COLOR_BGR2RGB)
+    st.session_state.last_frame_rgb = grid_rgb
+
+    video_placeholder.image(
+        grid_rgb,
+        channels="RGB",
+        use_container_width=True,
+    )
+
+    if not YOLO_AVAILABLE:
+        status_placeholder.warning("Ultralytics is not installed. Run: pip install ultralytics")
+    elif not is_yolo_model_available():
+        status_placeholder.warning("YOLO model not found.")
+    elif yolo_result.get("detected"):
+        detections = ", ".join(
+            f"{d['class']} ({d['confidence']:.0%})"
+            for d in yolo_result.get("detections", [])
+        )
+        status_placeholder.warning(f"YOLO detection: {detections}")
+    else:
+        status_placeholder.success("Live 3x3 multi-camera monitoring active...")
+
+
+@st.fragment(run_every=0.5)
+def live_camera_fragment(video_container, status_container):
+    st.session_state.video_placeholder = video_container
+    st.session_state.video_status = status_container
+    render_video_frame(video_container, status_container)
+
+
+def render_video_feed() -> None:
+    header_col, btn_col1, btn_col2 = st.columns([5, 1, 1])
+
+    with btn_col1:
+        if st.button(
+            "▶ Start",
+            use_container_width=True,
+            disabled=st.session_state.camera_running,
+            key="start_cam_btn"
+        ):
+            st.session_state.camera_running = True
+            st.session_state.last_error = ""
+            st.session_state.last_vlm_candidate_frame = None
+            st.session_state.latest_vlm_text = ""
+            st.session_state.last_frame_time = time.time()
+            
+            # Reset detection states upon startup to prevent legacy critical flags
+            st.session_state.latest_detection = None
+            st.session_state.alarm_active = False
+
+            if st.session_state.get("yolo_detector") is None:
+                st.session_state.yolo_detector = YOLOFireSmokeDetector()
+
+            st.rerun()
+
+    with btn_col2:
+        if st.button(
+            "⏹ Stop",
+            use_container_width=True,
+            disabled=not st.session_state.camera_running,
+            key="stop_cam_btn"
+        ):
+            st.session_state.camera_running = False
+
+            if st.session_state.get("alarm_active", False):
+                play_alert_sound(stop=True)
+                st.session_state.alarm_active = False
+
+            release_camera()
+            st.rerun()
+
+    video_placeholder = st.empty()
+    status_placeholder = st.empty()
+
+    if not st.session_state.camera_running:
+        if st.session_state.get("last_frame_rgb") is not None:
+            video_placeholder.image(
+                st.session_state.last_frame_rgb,
+                use_container_width=True,
+            )
+        else:
+            video_placeholder.image(
+                VideoCaptureManager.placeholder_frame(
+                    "Camera Stopped",
+                    "Click Start to begin monitoring.",
+                ),
+                use_container_width=True,
+            )
+        status_placeholder.info("Camera is stopped. Detection paused.")
+        return
+
+    live_camera_fragment(video_placeholder, status_placeholder)
+
+
+def render_forensic_log() -> None:
+    st.markdown("### Alert Timeline")
+
+    if not st.session_state.alert_history:
+        st.info("No events logged yet.")
+        return
+
+    df = pd.DataFrame(list(st.session_state.alert_history))
+
+    display_cols = [
+        "timestamp",
+        "severity",
+        "matched_source",
+        "matched_keyword",
+        "yara_severity",
+        "visual_severity",
+        "confidence",
+        "latency",
+        "fire_ratio",
+        "smoke_ratio",
+        "success",
+        "description",
+        "yolo_detected",
+        "yolo_classes",
+        "yolo_confidence",
+    ]
+
+    display_df = df[display_cols].copy()
+    display_df["latency_ms"] = (display_df["latency"] * 1000).round(1)
+    display_df["confidence"] = (
+        (display_df["confidence"] * 100).round(1).astype(str) + "%"
+    )
+    display_df = display_df.drop(columns=["latency"])
+
+    st.dataframe(
+        display_df.iloc[::-1],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.download_button(
+        "⬇️ Download alerts log CSV",
+        data=display_df.to_csv(index=False).encode("utf-8"),
+        file_name=f"cybervision_forensic_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="download_csv_btn"
+    )
+
+
+def render_charts() -> None:
+    c1, c2 = st.columns(2)
+
+    metrics_df = pd.DataFrame(list(st.session_state.metrics_history))
+
+    if not metrics_df.empty:
+        metrics_df = metrics_df.set_index("time")
+
+        with c1:
+            st.markdown("#### CPU/RAM Usage")
+            st.line_chart(metrics_df[["cpu", "ram"]])
+
+    else:
+        c1.info("No resource metrics yet.")
+
+    if st.session_state.alert_history:
+        alert_df = pd.DataFrame(list(st.session_state.alert_history))
+
+        severity_counts = (
+            alert_df["severity"]
+            .value_counts()
+            .reindex(["NORMAL", "MEDIUM", "HIGH", "CRITICAL"])
+            .fillna(0)
+        )
+
+        with c2:
+            st.markdown("#### Severity Distribution")
+            st.bar_chart(severity_counts)
+
+    else:
+        c2.info("No alert statistics yet.")
+
+    
+def render_header() -> None:
+    st.markdown(
+        """
+        <div class="hero">
+            <h1 class="hero-title">
+                🔥 CyberVision: Adaptive Context Optimization at the Edge
+            </h1>
+            <span class="pill">Real-time Fire and Smoke Detection</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+def main() -> None:
+    init_session_state()
+
+    start_sync_thread()
+
+    apply_theme()
+
+    render_header()
+
+    metrics = SystemMonitor.get_metrics()
+    if metrics["cpu"] > 90.0 or metrics["ram"] > 88.0:
+        st.error(f"⚠️ Critical System Load! CPU: {metrics['cpu']}% | RAM: {metrics['ram']}%. System throttling.")
+
+    render_sidebar()
+
+    render_status_cards()
+
+    tab_live, tab_logs, tab_analytics = st.tabs(
+        [
+            " Live Monitor",
+            " Alert Logs",
+            " Analytics",
+        ]
+    )
+
+    with tab_live:
+        cam_col, alert_col = st.columns([2, 1])
+
+        with cam_col:
+            render_video_feed()
+
+        with alert_col:
+            render_alert_center()
+
+    with tab_logs:
+        render_forensic_log()
+
+    with tab_analytics:
+        render_charts()
+
+
+if __name__ == "__main__":
+    main()
