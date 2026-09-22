@@ -1013,12 +1013,36 @@ class ResourceGovernor:
 # =============================================================================
 # MULTI-CAMERA HANDLING & 3x3 MATRIX
 # =============================================================================
-# A public STUN server is required for the visitor's browser and the
-# Streamlit Cloud container to negotiate a WebRTC connection across the
-# open internet (they're on different networks/behind NAT) — without an
-# ICE server the connection just never completes.
+# STUN alone tells the two sides what their public IP/port is, but
+# Streamlit Community Cloud's own network setup blocks the direct
+# peer-to-peer connection STUN sets up — the negotiation stalls and the
+# widget just sits there ("Camera unavailable" never clears). A TURN
+# server relays the media instead of connecting peer-to-peer, which is
+# what actually gets this working on Community Cloud. The turn: entries
+# below are the Open Relay Project's free public TURN server — fine for
+# low-traffic/personal use; swap in your own TURN credentials (e.g. from
+# Twilio's Network Traversal Service) if this ever gets flaky under load.
 RTC_CONFIGURATION = (
-    RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+    RTCConfiguration({
+        "iceServers": [
+            {"urls": ["stun:stun.relay.metered.ca:80"]},
+            {
+                "urls": ["turn:global.relay.metered.ca:80"],
+                "username": "openrelayproject",
+                "credential": "openrelayproject",
+            },
+            {
+                "urls": ["turn:global.relay.metered.ca:443"],
+                "username": "openrelayproject",
+                "credential": "openrelayproject",
+            },
+            {
+                "urls": ["turn:global.relay.metered.ca:443?transport=tcp"],
+                "username": "openrelayproject",
+                "credential": "openrelayproject",
+            },
+        ]
+    })
     if WEBRTC_AVAILABLE else None
 )
 
@@ -1075,7 +1099,7 @@ def render_browser_camera_widget() -> Optional["BrowserCameraProcessor"]:
         )
         return None
 
-    st.caption(":material/videocam: No physical camera on this server — streaming from your browser's camera instead. Allow camera access when prompted.")
+    st.caption(":material/videocam: No physical camera on this server — streaming from your browser's camera instead. Allow camera access when prompted, then wait a moment for it to connect.")
     ctx = webrtc_streamer(
         key="cybervision_browser_camera",
         mode=WebRtcMode.SENDONLY,
@@ -1083,6 +1107,20 @@ def render_browser_camera_widget() -> Optional["BrowserCameraProcessor"]:
         video_processor_factory=BrowserCameraProcessor,
         media_stream_constraints={"video": True, "audio": False},
         async_processing=True,
+        # This is only the browser's own raw self-preview (and the one-time
+        # device picker) — the processed feed with the hazard overlay, HUD
+        # text and 3x3 grid, matching the local/desktop look, is drawn
+        # separately below by render_video_frame(). Collapsing this to a
+        # thin strip (rather than display:none, which can make some
+        # browsers pause the capture) keeps the original full-size layout
+        # once the connection is up, while leaving the permission/device
+        # picker still reachable if it needs to reappear.
+        video_html_attrs={
+            "autoPlay": True,
+            "muted": True,
+            "controls": False,
+            "style": {"height": "1px", "width": "1px", "opacity": "0.01"},
+        },
     )
     return ctx.video_processor
 
