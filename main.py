@@ -840,6 +840,26 @@ def inject_custom_css() -> None:
         .video-status-bar b {{
             color: {accent_dark};
         }}
+
+        /* WebRTC transport is intentionally invisible. The dashboard's
+           Start button is the only user-facing camera control and the custom
+           3x3 matrix is the only visible camera feed. */
+        .st-key-webrtc_transport {{
+            height: 0 !important;
+            min-height: 0 !important;
+            max-height: 0 !important;
+            overflow: hidden !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            border: 0 !important;
+        }}
+        .st-key-webrtc_transport iframe {{
+            height: 1px !important;
+            min-height: 1px !important;
+            max-height: 1px !important;
+            opacity: 0 !important;
+            pointer-events: none !important;
+        }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -1221,8 +1241,20 @@ def _fetch_cloudflare_ice_servers(key_id: str, api_token: str) -> Optional[list]
             timeout=5,
         )
         resp.raise_for_status()
-        ice_servers = resp.json().get("iceServers")
-        return ice_servers or None
+        ice_servers = resp.json().get("iceServers") or []
+        # Cloudflare may return an alternate port-53 URL. Browsers can block
+        # that port, while the same response contains other TURN transports.
+        filtered = []
+        for server in ice_servers:
+            urls = server.get("urls", [])
+            if isinstance(urls, str):
+                urls = [urls]
+            urls = [u for u in urls if ":53" not in u]
+            if urls:
+                item = dict(server)
+                item["urls"] = urls
+                filtered.append(item)
+        return filtered or None
     except Exception:
         return None
 
@@ -1312,35 +1344,24 @@ def render_browser_camera_widget(playing: bool) -> None:
             )
         return
 
-    cf_key_id, cf_api_token = _get_cloudflare_turn_credentials()
-    metered_key, metered_domain = _get_metered_credentials()
-    has_turn = bool(REQUESTS_AVAILABLE and ((cf_key_id and cf_api_token) or (metered_key and metered_domain)))
-
-    if playing:
-        st.caption("📷 Browser camera mode — grant camera access when your browser prompts you.")
-        if not has_turn:
-            st.warning(
-                "No TURN server configured. Plain STUN (stun.l.google.com) is being used, "
-                "which works on many networks but Streamlit Community Cloud's firewall blocks "
-                "plain STUN-only WebRTC connections for some visitors, so the browser camera may "
-                "get stuck at 'Waiting for first frame'. Add CLOUDFLARE_TURN_KEY_ID / "
-                "CLOUDFLARE_TURN_KEY_API_TOKEN (recommended, from a free Cloudflare Realtime TURN "
-                "key — https://developers.cloudflare.com/realtime/turn/) or METERED_API_KEY / "
-                "METERED_DOMAIN (https://www.metered.ca/tools/openrelay/) to this app's Secrets to fix it."
-            )
-
-    ctx = webrtc_streamer(
-        key="cybervision-browser-camera",
-        mode=WebRtcMode.SENDONLY,
-        desired_playing_state=playing,
-        rtc_configuration=RTCConfiguration({"iceServers": get_ice_servers()}),
-        media_stream_constraints={"video": True, "audio": False},
-        video_processor_factory=BrowserCameraProcessor,
-        video_html_attrs=VideoHTMLAttributes(
-            autoPlay=True, controls=False, muted=True, style={"display": "none"}
-        ),
-        async_processing=True,
-    )
+    # WebRTC is transport-only. Keep it mounted at one stable location so
+    # its state is not duplicated, but hide its native preview/controls. The
+    # dashboard Start/Stop buttons control `desired_playing_state`, and the
+    # custom 3x3 matrix below is the only visible camera feed.
+    with st.container(key="webrtc_transport"):
+        ctx = webrtc_streamer(
+            key="cybervision-browser-camera",
+            mode=WebRtcMode.SENDONLY,
+            desired_playing_state=playing,
+            rtc_configuration=RTCConfiguration({"iceServers": get_ice_servers()}),
+            media_stream_constraints={"video": True, "audio": False},
+            video_processor_factory=BrowserCameraProcessor,
+            video_html_attrs=VideoHTMLAttributes(
+                autoPlay=True, controls=False, muted=True, style={"display": "none"}
+            ),
+            media_toggle_controls=False,
+            async_processing=True,
+        )
     st.session_state.webrtc_ctx = ctx
 
 
@@ -2581,10 +2602,8 @@ def render_video_feed() -> None:
             "Detection cannot start until that's fixed."
         )
 
-    # Mounted unconditionally (every render, in the same tree position)
-    # whenever this deployment is in browser-camera mode — see the docstring
-    # on render_browser_camera_widget for why conditional mounting breaks
-    # live updates. Start/Stop is controlled via desired_playing_state.
+    # Mount the browser-camera transport at one stable tree position.
+    # The dashboard Start button is the only user-facing camera control.
     if st.session_state.get("use_webrtc"):
         render_browser_camera_widget(playing=st.session_state.camera_running)
 
