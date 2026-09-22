@@ -1106,6 +1106,9 @@ def render_browser_camera_widget() -> None:
     ctx = webrtc_streamer(
         key="cybervision-browser-camera",
         mode=WebRtcMode.SENDONLY,
+        desired_playing_state=True,  # auto-connects as soon as this is mounted (on our own Start
+                                      # click) instead of requiring a second click on the widget's
+                                      # own internal Start button.
         rtc_configuration=RTC_CONFIGURATION,
         media_stream_constraints={"video": True, "audio": False},
         video_processor_factory=BrowserCameraProcessor,
