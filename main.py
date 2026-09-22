@@ -64,6 +64,13 @@ except Exception:
     RTCConfiguration = None
     WEBRTC_AVAILABLE = False
 
+try:
+    from twilio.rest import Client as TwilioClient
+    TWILIO_AVAILABLE = True
+except Exception:
+    TwilioClient = None
+    TWILIO_AVAILABLE = False
+
 
 def is_cloud_environment() -> bool:
     """Detect a hosted environment (e.g. Streamlit Community Cloud) that has
@@ -1064,10 +1071,6 @@ class ResourceGovernor:
 if WEBRTC_AVAILABLE:
     from streamlit_webrtc import VideoHTMLAttributes
 
-    RTC_CONFIGURATION = RTCConfiguration(
-        {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-    )
-
     class BrowserCameraProcessor(VideoProcessorBase):
         """Stores only the most recent frame received from the browser so the
         0.1s detection fragment can grab it without blocking on the media
@@ -1087,9 +1090,42 @@ if WEBRTC_AVAILABLE:
             with self._lock:
                 return None if self._latest_frame is None else self._latest_frame.copy()
 else:
-    RTC_CONFIGURATION = None
     BrowserCameraProcessor = None
     VideoHTMLAttributes = None
+
+
+def _get_twilio_credentials() -> Tuple[Optional[str], Optional[str]]:
+    sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    token = os.environ.get("TWILIO_AUTH_TOKEN")
+    if sid and token:
+        return sid, token
+    try:
+        sid = sid or st.secrets.get("TWILIO_ACCOUNT_SID")
+        token = token or st.secrets.get("TWILIO_AUTH_TOKEN")
+    except Exception:
+        pass
+    return sid, token
+
+
+@st.cache_data(ttl=3000, show_spinner=False)
+def get_ice_servers() -> list:
+    """Streamlit Community Cloud's networking blocks plain STUN-negotiated
+    WebRTC connections — a TURN relay is required there (documented by the
+    streamlit-webrtc maintainers). This fetches short-lived TURN credentials
+    from Twilio's free-trial Network Traversal Service when
+    TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN are configured (env vars or
+    Streamlit secrets), and falls back to STUN-only otherwise — which will
+    very likely fail to connect specifically on Streamlit Community Cloud."""
+    sid, token = _get_twilio_credentials()
+    if TWILIO_AVAILABLE and sid and token:
+        try:
+            client = TwilioClient(sid, token)
+            twilio_token = client.tokens.create()
+            if twilio_token.ice_servers:
+                return twilio_token.ice_servers
+        except Exception:
+            pass
+    return [{"urls": ["stun:stun.l.google.com:19302"]}]
 
 
 def render_browser_camera_widget(playing: bool) -> None:
@@ -1123,14 +1159,25 @@ def render_browser_camera_widget(playing: bool) -> None:
             )
         return
 
+    sid, token = _get_twilio_credentials()
+    has_turn = TWILIO_AVAILABLE and bool(sid) and bool(token)
+
     if playing:
         st.caption("📷 Browser camera mode — grant camera access when your browser prompts you.")
+        if not has_turn:
+            st.warning(
+                "No TURN server configured (TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN). "
+                "Streamlit Community Cloud blocks plain STUN-only WebRTC connections, so "
+                "the browser camera will likely get stuck at 'Waiting for first frame'. "
+                "Add a free Twilio trial account's credentials to this app's Secrets to fix it — "
+                "see https://github.com/whitphx/streamlit-webrtc#deploy-to-streamlit-community-cloud."
+            )
 
     ctx = webrtc_streamer(
         key="cybervision-browser-camera",
         mode=WebRtcMode.SENDONLY,
         desired_playing_state=playing,
-        rtc_configuration=RTC_CONFIGURATION,
+        rtc_configuration=RTCConfiguration({"iceServers": get_ice_servers()}),
         media_stream_constraints={"video": True, "audio": False},
         video_processor_factory=BrowserCameraProcessor,
         video_html_attrs=VideoHTMLAttributes(
