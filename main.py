@@ -54,21 +54,6 @@ except Exception:
     firestore = None
     GCP_AVAILABLE = False
 
-try:
-    # Lets the app pull video from the *visitor's* browser webcam over
-    # WebRTC. Needed because a Streamlit Cloud container has no physical
-    # camera of its own for cv2.VideoCapture to open (see
-    # local_camera_available() below) — the server can't see a webcam that
-    # only exists on the visitor's machine.
-    from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase, RTCConfiguration
-    WEBRTC_AVAILABLE = True
-except Exception:
-    webrtc_streamer = None
-    WebRtcMode = None
-    VideoProcessorBase = object
-    RTCConfiguration = None
-    WEBRTC_AVAILABLE = False
-
 
 # =============================================================================
 # CONFIGURATION
@@ -1013,125 +998,6 @@ class ResourceGovernor:
 # =============================================================================
 # MULTI-CAMERA HANDLING & 3x3 MATRIX
 # =============================================================================
-# STUN alone tells the two sides what their public IP/port is, but
-# Streamlit Community Cloud's own network setup blocks the direct
-# peer-to-peer connection STUN sets up — the negotiation stalls and the
-# widget just sits there ("Camera unavailable" never clears). A TURN
-# server relays the media instead of connecting peer-to-peer, which is
-# what actually gets this working on Community Cloud. The turn: entries
-# below are the Open Relay Project's free public TURN server — fine for
-# low-traffic/personal use; swap in your own TURN credentials (e.g. from
-# Twilio's Network Traversal Service) if this ever gets flaky under load.
-RTC_CONFIGURATION = (
-    RTCConfiguration({
-        "iceServers": [
-            {"urls": ["stun:stun.relay.metered.ca:80"]},
-            {
-                "urls": ["turn:global.relay.metered.ca:80"],
-                "username": "openrelayproject",
-                "credential": "openrelayproject",
-            },
-            {
-                "urls": ["turn:global.relay.metered.ca:443"],
-                "username": "openrelayproject",
-                "credential": "openrelayproject",
-            },
-            {
-                "urls": ["turn:global.relay.metered.ca:443?transport=tcp"],
-                "username": "openrelayproject",
-                "credential": "openrelayproject",
-            },
-        ]
-    })
-    if WEBRTC_AVAILABLE else None
-)
-
-
-@st.cache_resource(show_spinner=False)
-def local_camera_available() -> bool:
-    """
-    Probes once per server process whether cv2 can actually open a physical
-    camera here. True on a laptop/desktop run; always False on Streamlit
-    Cloud (and any other headless container), which is what produces the
-    "Camera unavailable" placeholder — there's no webcam attached to that
-    machine for cv2.VideoCapture to find. Cached so this cheap-but-not-free
-    probe runs once, not on every 0.1s fragment tick.
-    """
-    try:
-        cap = cv2.VideoCapture(CONFIG["CAMERA_SOURCES"][0])
-        ok = cap.isOpened()
-        cap.release()
-        return ok
-    except Exception:
-        return False
-
-
-class BrowserCameraProcessor(VideoProcessorBase):
-    """
-    Receives frames pushed from the visitor's own browser webcam over
-    WebRTC. recv() runs on streamlit-webrtc's background thread, so the
-    frame is handed off through a lock rather than touched directly from
-    Streamlit's render thread.
-    """
-    def __init__(self) -> None:
-        self.frame_bgr: Optional[np.ndarray] = None
-        self.lock = threading.Lock()
-
-    def recv(self, frame):
-        img = frame.to_ndarray(format="bgr24")
-        with self.lock:
-            self.frame_bgr = img
-        return frame
-
-
-def render_browser_camera_widget() -> Optional["BrowserCameraProcessor"]:
-    """
-    Mounts the WebRTC component once (outside the fast 0.1s fragment, so the
-    connection isn't torn down and rebuilt on every tick) and returns its
-    processor so the fragment can just read the latest frame off it.
-    """
-    if not WEBRTC_AVAILABLE:
-        st.warning(
-            "This server has no physical camera, and the `streamlit-webrtc` "
-            "package isn't installed, so there's no way to pull video from "
-            "your browser either. Add `streamlit-webrtc` and `av` to "
-            "requirements.txt to enable browser-camera streaming."
-        )
-        return None
-
-    # desired_playing_state=True skips the component's own "START" /
-    # "SELECT DEVICE" toolbar entirely and requests the default camera the
-    # moment this mounts — this function only runs while
-    # st.session_state.camera_running is True (see render_video_feed()), so
-    # pressing this app's own Start button is exactly the click that
-    # authorizes it. The one thing that still can't be skipped is the
-    # browser's own native "Allow camera?" permission popup the first time —
-    # every site that uses a camera has to clear that same browser-level
-    # gate, and it only appears once per browser.
-    ctx = webrtc_streamer(
-        key="cybervision_browser_camera",
-        mode=WebRtcMode.SENDONLY,
-        desired_playing_state=True,
-        rtc_configuration=RTC_CONFIGURATION,
-        video_processor_factory=BrowserCameraProcessor,
-        media_stream_constraints={"video": True, "audio": False},
-        async_processing=True,
-        # This is only the browser's own raw self-preview — the processed
-        # feed with the hazard overlay, HUD text and 3x3 grid, matching the
-        # local/desktop look, is drawn separately below by
-        # render_video_frame(). Collapsing this (rather than display:none,
-        # which can make some browsers pause the capture) keeps the
-        # original full-size layout as the only thing visibly showing.
-        video_html_attrs={
-            "autoPlay": True,
-            "muted": True,
-            "controls": False,
-            "style": {"height": "1px", "width": "1px", "opacity": "0.01"},
-        },
-    )
-    return ctx.video_processor
-
-
 @st.cache_resource(show_spinner=False)
 def get_camera_caps() -> Dict[int, cv2.VideoCapture]:
     caps = {}
@@ -1192,14 +1058,7 @@ def construct_3x3_grid(active_frames: Dict[int, np.ndarray], tile_w: int = 320, 
 
 class VideoCaptureManager:
     @staticmethod
-    def capture_active_frames(browser_frame: Optional[np.ndarray] = None) -> Tuple[Dict[int, np.ndarray], Optional[np.ndarray]]:
-        # A frame handed in from the visitor's browser (via WebRTC) takes
-        # priority and skips cv2 entirely — used on Streamlit Cloud, where
-        # cv2.VideoCapture has no physical camera to open.
-        if browser_frame is not None:
-            primary_frame = cv2.resize(browser_frame, (CONFIG["FRAME_WIDTH"], CONFIG["FRAME_HEIGHT"]))
-            return {0: browser_frame}, primary_frame
-
+    def capture_active_frames() -> Tuple[Dict[int, np.ndarray], Optional[np.ndarray]]:
         caps = get_camera_caps()
         active_frames = {}
         primary_frame = None
@@ -2218,7 +2077,7 @@ def render_resource_trend_preview() -> None:
 # =============================================================================
 # LIVE VIDEO STREAM (FULL-WIDTH 3x3 MATRIX)
 # =============================================================================
-def render_video_frame(video_placeholder, status_placeholder, browser_processor=None) -> None:
+def render_video_frame(video_placeholder, status_placeholder) -> None:
     # Evaluated every 0.1s fragment tick (see live_camera_fragment) so the
     # hazard card fades in immediately and disappears on its own once
     # CONFIG["TOAST_DISPLAY_SECONDS"] has elapsed — no early-return above
@@ -2237,19 +2096,10 @@ def render_video_frame(video_placeholder, status_placeholder, browser_processor=
         status_placeholder.info("Camera is stopped. Detection paused.")
         return
 
-    browser_frame = None
-    if browser_processor is not None:
-        with browser_processor.lock:
-            if browser_processor.frame_bgr is not None:
-                browser_frame = browser_processor.frame_bgr.copy()
-
-    active_frames, primary_frame = VideoCaptureManager.capture_active_frames(browser_frame)
+    active_frames, primary_frame = VideoCaptureManager.capture_active_frames()
 
     if primary_frame is None and not active_frames:
-        if browser_processor is not None:
-            status_placeholder.info("Waiting for your browser camera — allow camera access above.")
-        else:
-            status_placeholder.error("Camera unavailable.")
+        status_placeholder.error("Camera unavailable.")
         return
 
     current_time = time.time()
@@ -2299,8 +2149,8 @@ def render_video_frame(video_placeholder, status_placeholder, browser_processor=
 
 
 @st.fragment(run_every=0.1)
-def live_camera_fragment(video_container, status_container, browser_processor=None):
-    render_video_frame(video_container, status_container, browser_processor)
+def live_camera_fragment(video_container, status_container):
+    render_video_frame(video_container, status_container)
 
 
 def render_video_feed() -> None:
@@ -2330,10 +2180,6 @@ def render_video_feed() -> None:
             release_camera()
             st.rerun()
 
-    browser_processor = None
-    if st.session_state.camera_running and not local_camera_available():
-        browser_processor = render_browser_camera_widget()
-
     video_placeholder = st.empty()
     status_placeholder = st.empty()
 
@@ -2348,7 +2194,7 @@ def render_video_feed() -> None:
         status_placeholder.info("Camera is stopped. Detection paused.")
         return
 
-    live_camera_fragment(video_placeholder, status_placeholder, browser_processor)
+    live_camera_fragment(video_placeholder, status_placeholder)
 
 
 def _build_forensic_display_df() -> Optional[pd.DataFrame]:
