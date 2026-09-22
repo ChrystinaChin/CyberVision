@@ -48,10 +48,12 @@ except Exception:
 
 try:
     from google.cloud import firestore, storage
+    from google.oauth2 import service_account as gcp_service_account
     GCP_AVAILABLE = True
 except Exception:
     storage = None
     firestore = None
+    gcp_service_account = None
     GCP_AVAILABLE = False
 
 try:
@@ -134,8 +136,12 @@ CONFIG: Dict[str, Any] = {
     "LATENCY_HISTORY_MAX": 100,
     "TOAST_DISPLAY_SECONDS": 6.0,
     "YARA_RULE_PATH": "hazard_rules.yar",
-    "GCP_BUCKET": "your-gcp-bucket-name",
-    "GCP_PROJECT_ID": "your-gcp-project-id",
+    # Fill these in with your real GCS bucket + GCP project — cloud backup
+    # stays disabled (silently, by design) as long as GCP_BUCKET is left at
+    # this placeholder. See _get_gcp_service_account_info() for how
+    # credentials are supplied (Streamlit secrets / env var / local key file).
+    "GCP_BUCKET": "cybervision_history",
+    "GCP_PROJECT_ID": "c5c505d599a4735f61c6c6896dd3f47a2c28337b",
     "DB_FILE": "cybervision_buffer.db",
     "PENDING_UPLOADS_DIR": "pending_gcp_uploads",
     "YOLO_MODEL_PATH": os.path.join(
@@ -198,7 +204,9 @@ def sync_worker_loop() -> None:
     while True:
         if is_wifi_connected() and GCP_AVAILABLE and firestore is not None:
             try:
-                db_client = firestore.Client(project=CONFIG["GCP_PROJECT_ID"])
+                _, db_client = get_gcp_clients()
+                if db_client is None:
+                    raise RuntimeError("GCP credentials not configured")
                 with sqlite3.connect(CONFIG["DB_FILE"]) as conn:
                     cursor = conn.cursor()
                     cursor.execute("SELECT id, timestamp, severity, description, camera_id FROM pending_events WHERE synced = 0")
@@ -1107,6 +1115,81 @@ def _get_twilio_credentials() -> Tuple[Optional[str], Optional[str]]:
     return sid, token
 
 
+# =============================================================================
+# GOOGLE CLOUD CREDENTIALS
+# =============================================================================
+def _get_gcp_service_account_info() -> Optional[dict]:
+    """Resolve GCP service-account credentials without depending on a JSON
+    key file being present inside the deployed container (Streamlit
+    Community Cloud has no way to receive that file securely — anything
+    committed to the repo is public). Checked in order:
+
+    1. GCP_SERVICE_ACCOUNT_JSON env var — the whole key file contents as a
+       single string. Handy for Docker/VM deployments where secrets are
+       injected as environment variables.
+    2. st.secrets["gcp_service_account"] — a [gcp_service_account] TOML
+       table pasted into Streamlit Cloud's Secrets manager. This is the
+       recommended path for Streamlit Community Cloud.
+    3. A local service_account.json file next to this script — convenient
+       for local development only. Never commit this file to git; keep it
+       out of the repo (.gitignore) since it's a plaintext credential.
+    """
+    raw = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
+    if raw:
+        try:
+            return json.loads(raw)
+        except Exception:
+            pass
+
+    try:
+        if "gcp_service_account" in st.secrets:
+            return dict(st.secrets["gcp_service_account"])
+    except Exception:
+        pass
+
+    local_key_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "service_account.json"
+    )
+    if os.path.isfile(local_key_path):
+        try:
+            with open(local_key_path, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+
+    return None
+
+
+@st.cache_resource(show_spinner=False)
+def get_gcp_clients() -> Tuple[Optional[Any], Optional[Any]]:
+    """Cached (storage_client, firestore_client) pair, built once per
+    session. Prefers an explicit service-account key from
+    _get_gcp_service_account_info() (env var, Streamlit secrets, or a local
+    file); falls back to Application Default Credentials, which only work
+    when running on GCP infrastructure (GCE/Cloud Run) or after a local
+    `gcloud auth application-default login` — NOT on Streamlit Community
+    Cloud. Returns (None, None) if neither the library nor any credentials
+    are available, so every caller must check before using the result."""
+    if not GCP_AVAILABLE:
+        return None, None
+
+    info = _get_gcp_service_account_info()
+    project_id = CONFIG["GCP_PROJECT_ID"]
+
+    try:
+        if info and gcp_service_account is not None:
+            credentials = gcp_service_account.Credentials.from_service_account_info(info)
+            project_id = info.get("project_id", project_id)
+            storage_client = storage.Client(credentials=credentials, project=project_id)
+            db_client = firestore.Client(credentials=credentials, project=project_id)
+        else:
+            storage_client = storage.Client(project=project_id)
+            db_client = firestore.Client(project=project_id)
+        return storage_client, db_client
+    except Exception:
+        return None, None
+
+
 @st.cache_data(ttl=3000, show_spinner=False)
 def get_ice_servers() -> list:
     """Streamlit Community Cloud's networking blocks plain STUN-negotiated
@@ -1761,7 +1844,9 @@ def flush_pending_cloud_uploads() -> None:
         return
 
     try:
-        client = storage.Client()
+        client, _ = get_gcp_clients()
+        if client is None:
+            return
         bucket = client.bucket(CONFIG["GCP_BUCKET"])
     except Exception:
         return
@@ -1832,7 +1917,10 @@ def upload_to_google_cloud_async(frame: np.ndarray, alert: Dict[str, Any]) -> No
             if not ok:
                 return
 
-            client = storage.Client()
+            client, _ = get_gcp_clients()
+            if client is None:
+                _queue_image_for_later_upload(frame, alert)
+                return
             bucket = client.bucket(CONFIG["GCP_BUCKET"])
 
             image_blob = bucket.blob(image_name)
@@ -2163,6 +2251,16 @@ def render_dashboard_settings_panel() -> None:
             sync_label,
             value=st.session_state.cloud_sync_enabled,
         )
+
+        if st.session_state.cloud_sync_enabled:
+            if not GCP_AVAILABLE:
+                st.caption(":material/error: `google-cloud-firestore` / `google-cloud-storage` not installed.")
+            elif CONFIG["GCP_BUCKET"] == "your-gcp-bucket-name":
+                st.caption(":material/warning: Set CONFIG[\"GCP_BUCKET\"] / GCP_PROJECT_ID in main.py.")
+            elif _get_gcp_service_account_info() is None:
+                st.caption(":material/warning: No GCP credentials found (secrets, env var, or key file).")
+            else:
+                st.caption(":material/check_circle: GCP credentials loaded.")
 
         timeout_option = st.selectbox(
             "Inference timeout target",
