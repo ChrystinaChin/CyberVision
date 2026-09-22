@@ -1099,22 +1099,29 @@ def render_browser_camera_widget() -> Optional["BrowserCameraProcessor"]:
         )
         return None
 
-    st.caption(":material/videocam: No physical camera on this server — streaming from your browser's camera instead. Allow camera access when prompted, then wait a moment for it to connect.")
+    # desired_playing_state=True skips the component's own "START" /
+    # "SELECT DEVICE" toolbar entirely and requests the default camera the
+    # moment this mounts — this function only runs while
+    # st.session_state.camera_running is True (see render_video_feed()), so
+    # pressing this app's own Start button is exactly the click that
+    # authorizes it. The one thing that still can't be skipped is the
+    # browser's own native "Allow camera?" permission popup the first time —
+    # every site that uses a camera has to clear that same browser-level
+    # gate, and it only appears once per browser.
     ctx = webrtc_streamer(
         key="cybervision_browser_camera",
         mode=WebRtcMode.SENDONLY,
+        desired_playing_state=True,
         rtc_configuration=RTC_CONFIGURATION,
         video_processor_factory=BrowserCameraProcessor,
         media_stream_constraints={"video": True, "audio": False},
         async_processing=True,
-        # This is only the browser's own raw self-preview (and the one-time
-        # device picker) — the processed feed with the hazard overlay, HUD
-        # text and 3x3 grid, matching the local/desktop look, is drawn
-        # separately below by render_video_frame(). Collapsing this to a
-        # thin strip (rather than display:none, which can make some
-        # browsers pause the capture) keeps the original full-size layout
-        # once the connection is up, while leaving the permission/device
-        # picker still reachable if it needs to reappear.
+        # This is only the browser's own raw self-preview — the processed
+        # feed with the hazard overlay, HUD text and 3x3 grid, matching the
+        # local/desktop look, is drawn separately below by
+        # render_video_frame(). Collapsing this (rather than display:none,
+        # which can make some browsers pause the capture) keeps the
+        # original full-size layout as the only thing visibly showing.
         video_html_attrs={
             "autoPlay": True,
             "muted": True,
