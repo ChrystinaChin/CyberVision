@@ -67,11 +67,11 @@ except Exception:
     WEBRTC_AVAILABLE = False
 
 try:
-    from twilio.rest import Client as TwilioClient
-    TWILIO_AVAILABLE = True
+    import requests
+    REQUESTS_AVAILABLE = True
 except Exception:
-    TwilioClient = None
-    TWILIO_AVAILABLE = False
+    requests = None
+    REQUESTS_AVAILABLE = False
 
 
 def is_cloud_environment() -> bool:
@@ -1102,17 +1102,27 @@ else:
     VideoHTMLAttributes = None
 
 
-def _get_twilio_credentials() -> Tuple[Optional[str], Optional[str]]:
-    sid = os.environ.get("TWILIO_ACCOUNT_SID")
-    token = os.environ.get("TWILIO_AUTH_TOKEN")
-    if sid and token:
-        return sid, token
+def _get_secret(name: str) -> Optional[str]:
+    """Read a credential from env vars first, then Streamlit secrets."""
+    value = os.environ.get(name)
+    if value:
+        return value
     try:
-        sid = sid or st.secrets.get("TWILIO_ACCOUNT_SID")
-        token = token or st.secrets.get("TWILIO_AUTH_TOKEN")
+        return st.secrets.get(name)
     except Exception:
-        pass
-    return sid, token
+        return None
+
+
+def _get_cloudflare_turn_credentials() -> Tuple[Optional[str], Optional[str]]:
+    key_id = _get_secret("CLOUDFLARE_TURN_KEY_ID")
+    api_token = _get_secret("CLOUDFLARE_TURN_KEY_API_TOKEN")
+    return key_id, api_token
+
+
+def _get_metered_credentials() -> Tuple[Optional[str], Optional[str]]:
+    api_key = _get_secret("METERED_API_KEY")
+    domain = _get_secret("METERED_DOMAIN")  # e.g. "your-app.metered.live"
+    return api_key, domain
 
 
 # =============================================================================
@@ -1190,25 +1200,85 @@ def get_gcp_clients() -> Tuple[Optional[Any], Optional[Any]]:
         return None, None
 
 
+STUN_ONLY_ICE_SERVERS = [{"urls": ["stun:stun.l.google.com:19302"]}]
+
+
+def _fetch_cloudflare_ice_servers(key_id: str, api_token: str) -> Optional[list]:
+    """Mints a short-lived (24h TTL) TURN credential via Cloudflare's
+    Realtime TURN API. The long-lived API token stays server-side; only the
+    generated username/credential pair is handed to the browser. See
+    https://developers.cloudflare.com/realtime/turn/generate-credentials/"""
+    if not REQUESTS_AVAILABLE:
+        return None
+    try:
+        resp = requests.post(
+            f"https://rtc.live.cloudflare.com/v1/turn/keys/{key_id}/credentials/generate-ice-servers",
+            headers={
+                "Authorization": f"Bearer {api_token}",
+                "Content-Type": "application/json",
+            },
+            json={"ttl": 86400},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        ice_servers = resp.json().get("iceServers")
+        return ice_servers or None
+    except Exception:
+        return None
+
+
+def _fetch_metered_ice_servers(api_key: str, domain: str) -> Optional[list]:
+    """Metered.ca / Open Relay Project TURN credentials — a free alternative
+    that needs only an API key + your Metered subdomain, no Twilio-style
+    account. See https://www.metered.ca/tools/openrelay/"""
+    if not REQUESTS_AVAILABLE:
+        return None
+    try:
+        resp = requests.get(
+            f"https://{domain}/api/v1/turn/credentials",
+            params={"apiKey": api_key},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        ice_servers = resp.json()
+        return ice_servers or None
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=3000, show_spinner=False)
 def get_ice_servers() -> list:
-    """Streamlit Community Cloud's networking blocks plain STUN-negotiated
-    WebRTC connections — a TURN relay is required there (documented by the
-    streamlit-webrtc maintainers). This fetches short-lived TURN credentials
-    from Twilio's free-trial Network Traversal Service when
-    TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN are configured (env vars or
-    Streamlit secrets), and falls back to STUN-only otherwise — which will
-    very likely fail to connect specifically on Streamlit Community Cloud."""
-    sid, token = _get_twilio_credentials()
-    if TWILIO_AVAILABLE and sid and token:
-        try:
-            client = TwilioClient(sid, token)
-            twilio_token = client.tokens.create()
-            if twilio_token.ice_servers:
-                return twilio_token.ice_servers
-        except Exception:
-            pass
-    return [{"urls": ["stun:stun.l.google.com:19302"]}]
+    """Three-tier ICE server strategy, cheapest/simplest first:
+
+    1. Google's free public STUN server (STUN_ONLY_ICE_SERVERS) — zero setup,
+       works fine when the network path between browser and server allows
+       direct/STUN-negotiated UDP. This is what's used if neither TURN
+       option below is configured, and is always the final fallback.
+    2. Cloudflare Realtime TURN (recommended by the streamlit-webrtc
+       maintainers for platforms like Streamlit Community Cloud, whose
+       firewall blocks plain STUN-negotiated connections) — used when
+       CLOUDFLARE_TURN_KEY_ID / CLOUDFLARE_TURN_KEY_API_TOKEN are configured
+       (env vars or Streamlit secrets).
+    3. Metered.ca / Open Relay Project — a free TURN alternative, used when
+       METERED_API_KEY / METERED_DOMAIN are configured instead of Cloudflare.
+
+    Whichever TURN tier is configured takes priority over plain STUN, since
+    STUN alone is the one most likely to leave the stream stuck at
+    "Waiting for first frame" on a hosted platform.
+    """
+    cf_key_id, cf_api_token = _get_cloudflare_turn_credentials()
+    if cf_key_id and cf_api_token:
+        ice_servers = _fetch_cloudflare_ice_servers(cf_key_id, cf_api_token)
+        if ice_servers:
+            return ice_servers
+
+    metered_key, metered_domain = _get_metered_credentials()
+    if metered_key and metered_domain:
+        ice_servers = _fetch_metered_ice_servers(metered_key, metered_domain)
+        if ice_servers:
+            return ice_servers
+
+    return STUN_ONLY_ICE_SERVERS
 
 
 def render_browser_camera_widget(playing: bool) -> None:
@@ -1242,18 +1312,21 @@ def render_browser_camera_widget(playing: bool) -> None:
             )
         return
 
-    sid, token = _get_twilio_credentials()
-    has_turn = TWILIO_AVAILABLE and bool(sid) and bool(token)
+    cf_key_id, cf_api_token = _get_cloudflare_turn_credentials()
+    metered_key, metered_domain = _get_metered_credentials()
+    has_turn = bool(REQUESTS_AVAILABLE and ((cf_key_id and cf_api_token) or (metered_key and metered_domain)))
 
     if playing:
         st.caption("📷 Browser camera mode — grant camera access when your browser prompts you.")
         if not has_turn:
             st.warning(
-                "No TURN server configured (TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN). "
-                "Streamlit Community Cloud blocks plain STUN-only WebRTC connections, so "
-                "the browser camera will likely get stuck at 'Waiting for first frame'. "
-                "Add a free Twilio trial account's credentials to this app's Secrets to fix it — "
-                "see https://github.com/whitphx/streamlit-webrtc#deploy-to-streamlit-community-cloud."
+                "No TURN server configured. Plain STUN (stun.l.google.com) is being used, "
+                "which works on many networks but Streamlit Community Cloud's firewall blocks "
+                "plain STUN-only WebRTC connections for some visitors, so the browser camera may "
+                "get stuck at 'Waiting for first frame'. Add CLOUDFLARE_TURN_KEY_ID / "
+                "CLOUDFLARE_TURN_KEY_API_TOKEN (recommended, from a free Cloudflare Realtime TURN "
+                "key — https://developers.cloudflare.com/realtime/turn/) or METERED_API_KEY / "
+                "METERED_DOMAIN (https://www.metered.ca/tools/openrelay/) to this app's Secrets to fix it."
             )
 
     ctx = webrtc_streamer(
