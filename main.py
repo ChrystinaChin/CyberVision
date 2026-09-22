@@ -1062,6 +1062,8 @@ class ResourceGovernor:
 # own device camera in the browser and streams frames to the server.
 # =============================================================================
 if WEBRTC_AVAILABLE:
+    from streamlit_webrtc import VideoHTMLAttributes
+
     RTC_CONFIGURATION = RTCConfiguration(
         {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
     )
@@ -1087,31 +1089,53 @@ if WEBRTC_AVAILABLE:
 else:
     RTC_CONFIGURATION = None
     BrowserCameraProcessor = None
+    VideoHTMLAttributes = None
 
 
-def render_browser_camera_widget() -> None:
-    """Mounts the WebRTC component once per full page render (NOT inside the
-    0.1s fragment — remounting a WebRTC connection every 100ms would repeatedly
-    drop it). The fragment reads frames back out via st.session_state.webrtc_ctx."""
+def render_browser_camera_widget(playing: bool) -> None:
+    """Mounts the WebRTC component ONCE PER PAGE RENDER, unconditionally
+    (same tree position on every run, whether the camera is running or
+    stopped). Toggling `desired_playing_state` — rather than conditionally
+    including/excluding this call — is the documented way to start/stop the
+    stream without remounting it.
+
+    This matters: streamlit-webrtc is a stateful, bidirectional component,
+    so its own connection-state changes trigger extra full-script reruns.
+    If it were only mounted while camera_running (changing the element tree
+    shape between runs), those reruns desync Streamlit's element
+    reconciliation for anything rendered after it in the tree — including
+    the video_placeholder the 0.1s fragment writes into. Symptom: frame/
+    hazard counters keep incrementing (the Python side is fine) but nothing
+    visibly updates until Stop is pressed and a plain, non-fragment render
+    path takes over. Keeping this call unconditional avoids that entirely.
+
+    The native local-preview <video> element is hidden via CSS (our own
+    3x3 grid is the visible feed) — hiding it doesn't stop the underlying
+    track, so frames still reach BrowserCameraProcessor.recv() normally.
+    """
     if not WEBRTC_AVAILABLE:
-        st.error(
-            "Browser camera mode requires the `streamlit-webrtc` and `av` packages, "
-            "which are listed in requirements.txt but failed to import. Check the "
-            "deployment logs — this is usually a missing system library (see packages.txt: "
-            "libavformat-dev, libavdevice-dev, libgl1)."
-        )
+        if playing:
+            st.error(
+                "Browser camera mode requires the `streamlit-webrtc` and `av` packages, "
+                "which are listed in requirements.txt but failed to import. Check the "
+                "deployment logs — this is usually a missing system library (see "
+                "packages.txt: libavformat-dev, libavdevice-dev, libgl1)."
+            )
         return
 
-    st.caption("📷 Browser camera mode — grant camera access when your browser prompts you.")
+    if playing:
+        st.caption("📷 Browser camera mode — grant camera access when your browser prompts you.")
+
     ctx = webrtc_streamer(
         key="cybervision-browser-camera",
         mode=WebRtcMode.SENDONLY,
-        desired_playing_state=True,  # auto-connects as soon as this is mounted (on our own Start
-                                      # click) instead of requiring a second click on the widget's
-                                      # own internal Start button.
+        desired_playing_state=playing,
         rtc_configuration=RTC_CONFIGURATION,
         media_stream_constraints={"video": True, "audio": False},
         video_processor_factory=BrowserCameraProcessor,
+        video_html_attrs=VideoHTMLAttributes(
+            autoPlay=True, controls=False, muted=True, style={"display": "none"}
+        ),
         async_processing=True,
     )
     st.session_state.webrtc_ctx = ctx
@@ -2339,11 +2363,12 @@ def render_video_feed() -> None:
             "Detection cannot start until that's fixed."
         )
 
-    # Mounted outside the 0.1s fragment on purpose: remounting a WebRTC
-    # connection every tick would repeatedly drop it. It's only mounted while
-    # camera_running so the browser doesn't hold the device open needlessly.
-    if st.session_state.get("use_webrtc") and st.session_state.camera_running:
-        render_browser_camera_widget()
+    # Mounted unconditionally (every render, in the same tree position)
+    # whenever this deployment is in browser-camera mode — see the docstring
+    # on render_browser_camera_widget for why conditional mounting breaks
+    # live updates. Start/Stop is controlled via desired_playing_state.
+    if st.session_state.get("use_webrtc"):
+        render_browser_camera_widget(playing=st.session_state.camera_running)
 
     video_placeholder = st.empty()
     status_placeholder = st.empty()
