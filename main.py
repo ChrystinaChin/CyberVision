@@ -54,6 +54,57 @@ except Exception:
     firestore = None
     GCP_AVAILABLE = False
 
+try:
+    from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase, RTCConfiguration
+    WEBRTC_AVAILABLE = True
+except Exception:
+    webrtc_streamer = None
+    WebRtcMode = None
+    VideoProcessorBase = object
+    RTCConfiguration = None
+    WEBRTC_AVAILABLE = False
+
+
+def is_cloud_environment() -> bool:
+    """Detect a hosted environment (e.g. Streamlit Community Cloud) that has
+    no physical camera device attached, so cv2.VideoCapture can never work
+    there and the app should fall back to capturing the visitor's own
+    browser camera over WebRTC instead.
+
+    Order of checks:
+    1. Explicit manual override via env vars (useful for testing either path).
+    2. Streamlit Community Cloud checks the repo out under /mount/src/<repo>.
+    3. Streamlit Community Cloud containers run as the "appuser" user.
+    """
+    force_webrtc = os.environ.get("CYBERVISION_FORCE_WEBRTC", "").strip().lower()
+    if force_webrtc in ("1", "true", "yes"):
+        return True
+
+    force_local = os.environ.get("CYBERVISION_FORCE_LOCAL_CAMERA", "").strip().lower()
+    if force_local in ("1", "true", "yes"):
+        return False
+
+    if os.path.exists("/mount/src"):
+        return True
+
+    if os.environ.get("HOME") == "/home/appuser":
+        return True
+
+    return False
+
+
+def local_camera_available() -> bool:
+    """Best-effort probe for a real, locally-attached camera device. Used as
+    a fallback signal in case is_cloud_environment() doesn't recognize the
+    hosting platform but no local camera actually exists."""
+    try:
+        probe = cv2.VideoCapture(CONFIG["CAMERA_SOURCES"][0])
+        opened = probe.isOpened()
+        probe.release()
+        return opened
+    except Exception:
+        return False
+
 
 # =============================================================================
 # CONFIGURATION
@@ -207,11 +258,21 @@ def init_session_state() -> None:
         "last_triggered_alert_ts": 0.0,
         "active_hazard_toast": None,
         "active_page": "Dashboard",
+        "webrtc_ctx": None,
     }
 
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+    if "use_webrtc" not in st.session_state:
+        # Decide once per session which capture path to use: browser WebRTC
+        # (needed on hosted platforms with no physical camera) or the local
+        # cv2.VideoCapture multi-camera path (for running on a machine that
+        # actually has camera hardware attached, e.g. local development).
+        needs_browser_camera = is_cloud_environment() or not local_camera_available()
+        st.session_state.use_webrtc = needs_browser_camera and WEBRTC_AVAILABLE
+        st.session_state.webrtc_unavailable_on_cloud = needs_browser_camera and not WEBRTC_AVAILABLE
 
 
 @st.cache_data
@@ -996,7 +1057,65 @@ class ResourceGovernor:
 
 
 # =============================================================================
-# MULTI-CAMERA HANDLING & 3x3 MATRIX
+# BROWSER CAMERA (WEBRTC) — used on hosted deployments with no physical
+# camera attached (e.g. Streamlit Community Cloud). Captures the visitor's
+# own device camera in the browser and streams frames to the server.
+# =============================================================================
+if WEBRTC_AVAILABLE:
+    RTC_CONFIGURATION = RTCConfiguration(
+        {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+    )
+
+    class BrowserCameraProcessor(VideoProcessorBase):
+        """Stores only the most recent frame received from the browser so the
+        0.1s detection fragment can grab it without blocking on the media
+        stream itself."""
+
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self._latest_frame: Optional[np.ndarray] = None
+
+        def recv(self, frame):
+            img = frame.to_ndarray(format="bgr24")
+            with self._lock:
+                self._latest_frame = img
+            return frame
+
+        def get_latest_frame(self) -> Optional[np.ndarray]:
+            with self._lock:
+                return None if self._latest_frame is None else self._latest_frame.copy()
+else:
+    RTC_CONFIGURATION = None
+    BrowserCameraProcessor = None
+
+
+def render_browser_camera_widget() -> None:
+    """Mounts the WebRTC component once per full page render (NOT inside the
+    0.1s fragment — remounting a WebRTC connection every 100ms would repeatedly
+    drop it). The fragment reads frames back out via st.session_state.webrtc_ctx."""
+    if not WEBRTC_AVAILABLE:
+        st.error(
+            "Browser camera mode requires the `streamlit-webrtc` and `av` packages, "
+            "which are listed in requirements.txt but failed to import. Check the "
+            "deployment logs — this is usually a missing system library (see packages.txt: "
+            "libavformat-dev, libavdevice-dev, libgl1)."
+        )
+        return
+
+    st.caption("📷 Browser camera mode — grant camera access when your browser prompts you.")
+    ctx = webrtc_streamer(
+        key="cybervision-browser-camera",
+        mode=WebRtcMode.SENDONLY,
+        rtc_configuration=RTC_CONFIGURATION,
+        media_stream_constraints={"video": True, "audio": False},
+        video_processor_factory=BrowserCameraProcessor,
+        async_processing=True,
+    )
+    st.session_state.webrtc_ctx = ctx
+
+
+# =============================================================================
+# MULTI-CAMERA HANDLING & 3x3 MATRIX (local cv2 devices only)
 # =============================================================================
 @st.cache_resource(show_spinner=False)
 def get_camera_caps() -> Dict[int, cv2.VideoCapture]:
@@ -1014,6 +1133,11 @@ def get_camera_caps() -> Dict[int, cv2.VideoCapture]:
 
 
 def release_camera() -> None:
+    if st.session_state.get("use_webrtc"):
+        # Nothing to release server-side; the browser owns the camera device
+        # and tears its own stream down when the webrtc component unmounts
+        # or permission is revoked.
+        return
     try:
         caps = get_camera_caps()
         for cap in caps.values():
@@ -1059,6 +1183,31 @@ def construct_3x3_grid(active_frames: Dict[int, np.ndarray], tile_w: int = 320, 
 class VideoCaptureManager:
     @staticmethod
     def capture_active_frames() -> Tuple[Dict[int, np.ndarray], Optional[np.ndarray]]:
+        if st.session_state.get("use_webrtc"):
+            return VideoCaptureManager._capture_from_browser()
+        return VideoCaptureManager._capture_from_local_devices()
+
+    @staticmethod
+    def _capture_from_browser() -> Tuple[Dict[int, np.ndarray], Optional[np.ndarray]]:
+        # Only CAM_01 is real here — a browser only exposes the visitor's own
+        # device camera(s), never a bank of 9 independent sources, so the
+        # other grid tiles stay in their "NO CAMERA DETECTED" placeholder
+        # state. Detection still runs off this single live feed.
+        ctx = st.session_state.get("webrtc_ctx")
+        if ctx is None or ctx.video_processor is None:
+            st.session_state.last_error = "Waiting for browser camera permission..."
+            return {}, None
+
+        frame = ctx.video_processor.get_latest_frame()
+        if frame is None:
+            st.session_state.last_error = "Waiting for first frame from browser camera..."
+            return {}, None
+
+        primary_frame = cv2.resize(frame, (CONFIG["FRAME_WIDTH"], CONFIG["FRAME_HEIGHT"]))
+        return {0: frame}, primary_frame
+
+    @staticmethod
+    def _capture_from_local_devices() -> Tuple[Dict[int, np.ndarray], Optional[np.ndarray]]:
         caps = get_camera_caps()
         active_frames = {}
         primary_frame = None
@@ -2099,7 +2248,7 @@ def render_video_frame(video_placeholder, status_placeholder) -> None:
     active_frames, primary_frame = VideoCaptureManager.capture_active_frames()
 
     if primary_frame is None and not active_frames:
-        status_placeholder.error("Camera unavailable.")
+        status_placeholder.error(st.session_state.get("last_error") or "Camera unavailable.")
         return
 
     current_time = time.time()
@@ -2179,6 +2328,19 @@ def render_video_feed() -> None:
             st.session_state.alarm_active = False
             release_camera()
             st.rerun()
+
+    if st.session_state.get("webrtc_unavailable_on_cloud"):
+        st.error(
+            "This deployment has no local camera device, and the browser-camera "
+            "(streamlit-webrtc) packages failed to load — see the deployment logs. "
+            "Detection cannot start until that's fixed."
+        )
+
+    # Mounted outside the 0.1s fragment on purpose: remounting a WebRTC
+    # connection every tick would repeatedly drop it. It's only mounted while
+    # camera_running so the browser doesn't hold the device open needlessly.
+    if st.session_state.get("use_webrtc") and st.session_state.camera_running:
+        render_browser_camera_widget()
 
     video_placeholder = st.empty()
     status_placeholder = st.empty()
