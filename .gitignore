@@ -1,5 +1,6 @@
 .streamlit/secrets.toml
 client_secret_*.json
 cybervision_buffer.db
+service_account.json
 __pycache__/
 *.pt
