@@ -1691,6 +1691,41 @@ def frame_to_base64_jpeg(frame: np.ndarray) -> str:
 # =============================================================================
 # YOLO FIRE & SMOKE DETECTION
 # =============================================================================
+def get_yolo_debug_info() -> Dict[str, Any]:
+    """Raw, unambiguous facts about why YOLO is or isn't active -- always
+    populated, never falls back to a vague 'unknown reason'."""
+    model_path = CONFIG["YOLO_MODEL_PATH"]
+    model_dir = os.path.dirname(model_path)
+
+    try:
+        dir_listing = os.listdir(model_dir) if os.path.isdir(model_dir) else []
+    except Exception as exc:
+        dir_listing = [f"<could not list directory: {exc}>"]
+
+    info = {
+        "YOLO_AVAILABLE (ultralytics imported)": YOLO_AVAILABLE,
+        "ultralytics import error": YOLO_IMPORT_ERROR or "(none)",
+        "cwd": os.getcwd(),
+        "expected model path": model_path,
+        "os.path.exists(model_path)": os.path.exists(model_path),
+        "os.path.isfile(model_path)": os.path.isfile(model_path),
+        "files in that directory": dir_listing,
+        "load_yolo_model() result": None,
+        "load exception": "(not attempted)",
+    }
+
+    if YOLO_AVAILABLE and os.path.exists(model_path):
+        try:
+            model = load_yolo_model()
+            info["load_yolo_model() result"] = "loaded OK" if model is not None else "returned None"
+            info["load exception"] = YOLO_LOAD_ERROR or "(none)"
+        except Exception as exc:
+            info["load_yolo_model() result"] = "raised an exception"
+            info["load exception"] = f"{type(exc).__name__}: {exc}"
+
+    return info
+
+
 YOLO_LOAD_ERROR: str = ""  # set by load_yolo_model(); read by get_yolo_load_error()
 
 
@@ -2601,7 +2636,9 @@ def render_dashboard_settings_panel() -> None:
             st.info("Model/YARA backend notice: Active fallback running.")
 
         if not is_yolo_model_available():
-            st.caption(f":material/error: YOLO not active — {get_yolo_load_error() or 'unknown reason'}")
+            with st.expander(":material/error: YOLO not active — details", expanded=True):
+                for label, value in get_yolo_debug_info().items():
+                    st.text(f"{label}: {value}")
 
 
 # =============================================================================
