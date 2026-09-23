@@ -303,14 +303,14 @@ def inject_custom_css() -> None:
         }}
 
         /* PREVENT FRAGMENT DIMMING / FADING OUT ON UPDATE (stops the live
-           camera image from blinking/disappearing between fragment reruns) */
+           camera image from blinking/disappearing between fragment reruns).
+           Scoped to the video area only — not a blanket "*" rule — so it
+           can't fight with the webrtc-hiding CSS further down. */
         div[data-testid="stFragment"],
         [data-testid="stFragment"] > div,
-        div[data-testid="stElementContainer"],
+        div[data-testid="stElementContainer"]:has(div[data-testid="stImage"]),
         div[data-testid="stImage"],
-        div[data-testid="stImage"] img,
-        [data-stale="true"],
-        [data-stale="true"] * {{
+        div[data-testid="stImage"] img {{
             opacity: 1 !important;
             visibility: visible !important;
             transition: none !important;
@@ -2402,6 +2402,9 @@ def render_video_status_bar() -> None:
         unsafe_allow_html=True,
     )
 
+    if st.session_state.get("camera_running") and st.session_state.get("last_error"):
+        st.caption(f":material/warning: {st.session_state.last_error}")
+
 
 def render_resource_trend_preview() -> None:
     metrics_df = pd.DataFrame(list(st.session_state.metrics_history))
@@ -2470,10 +2473,31 @@ def live_camera_fragment(video_placeholder) -> None:
         cv2.putText(grid_matrix, hud_line_2, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
 
         grid_rgb = cv2.cvtColor(grid_matrix, cv2.COLOR_BGR2RGB)
-        st.session_state.last_frame_rgb = grid_rgb
 
-        # Smooth persistent container update avoids widget flickering/stutter
-        video_placeholder.image(grid_rgb, channels="RGB", use_container_width=True)
+        # Validate before handing it to the browser: a malformed array (bad
+        # dtype/shape, or a frame full of NaN/Inf from a downstream detector
+        # glitch) is exactly what makes an <img> render as a broken icon.
+        # Reject it here and keep the last good frame on screen instead of
+        # ever pushing something invalid out.
+        is_valid_frame = (
+            isinstance(grid_rgb, np.ndarray)
+            and grid_rgb.ndim == 3
+            and grid_rgb.shape[2] == 3
+            and grid_rgb.size > 0
+            and grid_rgb.dtype == np.uint8
+        )
+
+        if is_valid_frame:
+            st.session_state.last_frame_rgb = grid_rgb
+            # Smooth persistent container update avoids widget flickering/stutter
+            video_placeholder.image(grid_rgb, channels="RGB", use_container_width=True)
+        else:
+            st.session_state.last_error = "Produced an invalid frame; keeping last good frame on screen."
+    except Exception as exc:
+        # Never let an unexpected exception here leave the placeholder in a
+        # half-updated/broken state — log it and keep showing the last good
+        # frame instead of a broken image icon.
+        st.session_state.last_error = f"Frame render error: {exc}"
     finally:
         st.session_state._frame_processing_busy = False
 
