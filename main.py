@@ -2031,8 +2031,7 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
 
     VLMInference.drain_worker_queue()
 
-    visual_result = VisualFireSmokeDetector.detect(frame)
-
+    # 1. Primary Object Detection (YOLO)
     yolo_detector = st.session_state.get("yolo_detector")
     if yolo_detector is None:
         yolo_detector = YOLOFireSmokeDetector()
@@ -2053,22 +2052,14 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
             "classes": [], "annotated_frame": frame,
         }
 
-    yolo_severity = yolo_detector.hazard_severity(yolo_result)
-    # Exposed to UI so Active Monitoring severity mirrors live YOLO result directly
+    # Primary YOLO severity drives system alert state
+    yolo_severity = yolo_detector.hazard_severity(yolo_result) if yolo_result.get("detected") else "NORMAL"
     st.session_state.yolo_severity = yolo_severity
 
-    if SEVERITY_STYLE[yolo_severity]["score"] > SEVERITY_STYLE[visual_result["visual_severity"]]["score"]:
-        visual_result["visual_severity"] = yolo_severity
-        if yolo_result.get("detections"):
-            first = yolo_result["detections"][0]
-            visual_result["visual_keyword"] = f"yolo_{first['class']}_{first['confidence']:.2f}"
+    visual_result = VisualFireSmokeDetector.detect(frame)
 
-    candidate_hazard = (
-        yolo_result.get("detected", False)
-        or visual_result.get("visual_severity", "NORMAL") != "NORMAL"
-    )
-
-    frame_number = st.session_state.frames_processed
+    # VLM trigger ONLY fires when YOLO actually detects a hazard
+    candidate_hazard = yolo_result.get("detected", False)
     analyze_this_frame = (
         candidate_hazard
         and frame_number % max(1, CONFIG["ANALYZE_EVERY_N_FRAMES"]) == 0
@@ -2091,31 +2082,41 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
         detection_text = ", ".join(f"{d['class']} {d['confidence']:.0%}" for d in yolo_result["detections"])
         public_description = f"YOLO detected: {detection_text}. VLM: {vlm_text}"
 
+    is_hazard = yolo_result.get("detected", False)
+    confidence = yolo_result.get("highest_confidence", 0.0) if is_hazard else 0.0
+
     alert = {
         "timestamp": datetime.now().strftime("%H:%M:%S"),
         "description": public_description,
         "success": True,
         "latency": latency,
-        "verified": verdict["is_hazard"],
-        "yolo_detected": yolo_result.get("detected", False),
+        "verified": is_hazard,
+        "yolo_detected": is_hazard,
         "yolo_classes": ", ".join(yolo_result.get("classes", [])),
-        "yolo_confidence": yolo_result.get("highest_confidence", 0.0),
-        **verdict,
+        "yolo_confidence": confidence,
+        "severity": yolo_severity,
+        "is_hazard": is_hazard,
+        "confidence": confidence,
+        "matched_keyword": verdict.get("matched_keyword", "none"),
+        "matched_source": "YOLO_DETECTOR" if is_hazard else "SYSTEM",
+        "yara_severity": verdict.get("yara_severity", "NORMAL"),
+        "visual_severity": visual_result.get("visual_severity", "NORMAL"),
+        "fire_ratio": visual_result.get("fire_ratio", 0.0),
+        "smoke_ratio": visual_result.get("smoke_ratio", 0.0),
+        "yara_available": YARA_AVAILABLE,
     }
 
     st.session_state.alert_history.append(alert)
     st.session_state.latest_detection = alert
 
-    # Trigger audio & hazard-card notifications on threat detection
-    hazard_title = determine_hazard_title(alert)
-    effective_severity = yolo_severity if yolo_severity != "NORMAL" else alert.get("severity", "NORMAL")
+    # Trigger alerts ONLY if YOLO identifies fire or smoke
+    if yolo_severity != "NORMAL":
+        hazard_title = determine_hazard_title(alert)
+        dispatch_hazard_alerts(yolo_severity, hazard_title)
 
-    if effective_severity != "NORMAL":
-        dispatch_hazard_alerts(effective_severity, hazard_title)
+    play_critical_alarm(yolo_severity == "CRITICAL")
 
-    play_critical_alarm(effective_severity == "CRITICAL")
-
-    if verdict["is_hazard"]:
+    if is_hazard:
         upload_to_google_cloud_async(frame, alert)
 
     return {
@@ -2361,7 +2362,6 @@ def render_dashboard_header() -> None:
 def _render_live_stats_body() -> None:
     latest = st.session_state.get("latest_detection") or {}
 
-    # Severity mirrors YOLO severity directly, matching Cam1 status
     severity = str(st.session_state.get("yolo_severity", "NORMAL")).upper()
     if severity not in SEVERITY_STYLE:
         severity = "NORMAL"
@@ -2421,24 +2421,17 @@ def render_resource_trend_preview() -> None:
 # =============================================================================
 # LIVE VIDEO STREAM (FULL-WIDTH 3x3 MATRIX)
 # =============================================================================
-def render_video_frame(video_placeholder, status_placeholder) -> None:
+@st.fragment(run_every=0.1)
+def live_camera_fragment() -> None:
     render_custom_hazard_toast()
 
     if not st.session_state.get("camera_running", False):
-        if st.session_state.get("last_frame_rgb") is not None:
-            video_placeholder.image(st.session_state.last_frame_rgb, use_container_width=True)
-        else:
-            video_placeholder.image(
-                VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
-                use_container_width=True,
-            )
-        status_placeholder.info("Camera is stopped. Detection paused.")
         return
 
     active_frames, primary_frame = VideoCaptureManager.capture_active_frames()
 
     if primary_frame is None and not active_frames:
-        status_placeholder.error(st.session_state.get("last_error") or "Camera unavailable.")
+        st.error(st.session_state.get("last_error") or "Camera unavailable.")
         return
 
     current_time = time.time()
@@ -2473,23 +2466,18 @@ def render_video_frame(video_placeholder, status_placeholder) -> None:
     grid_rgb = cv2.cvtColor(grid_matrix, cv2.COLOR_BGR2RGB)
     st.session_state.last_frame_rgb = grid_rgb
 
-    # Smooth native Streamlit image rendering (prevents base64 flickering)
-    video_placeholder.image(grid_rgb, channels="RGB", use_container_width=True)
+    # Native Streamlit image call inside fragment avoids element flickering
+    st.image(grid_rgb, channels="RGB", use_container_width=True)
 
     if not YOLO_AVAILABLE:
-        status_placeholder.warning("Ultralytics is not installed.")
+        st.warning("Ultralytics is not installed.")
     elif not is_yolo_model_available():
-        status_placeholder.warning("YOLO model not found.")
+        st.warning("YOLO model not found.")
     elif yolo_result.get("detected"):
         detections = ", ".join(f"{d['class']} ({d['confidence']:.0%})" for d in yolo_result.get("detections", []))
-        status_placeholder.warning(f"YOLO detection: {detections}")
+        st.warning(f"YOLO detection: {detections}")
     else:
-        status_placeholder.success("Live 3x3 multi-camera monitoring active...")
-
-
-@st.fragment(run_every=0.1)
-def live_camera_fragment(video_container, status_container):
-    render_video_frame(video_container, status_container)
+        st.success("Live 3x3 multi-camera monitoring active...")
 
 
 def render_video_feed() -> None:
@@ -2505,6 +2493,7 @@ def render_video_feed() -> None:
             st.session_state.latest_detection = None
             st.session_state.yolo_severity = "NORMAL"
             st.session_state.alarm_active = False
+            st.session_state.active_hazard_toast = None
 
             if st.session_state.get("yolo_detector") is None:
                 st.session_state.yolo_detector = YOLOFireSmokeDetector()
@@ -2516,6 +2505,7 @@ def render_video_feed() -> None:
             st.session_state.camera_running = False
             st.session_state.yolo_severity = "NORMAL"
             st.session_state.alarm_active = False
+            st.session_state.active_hazard_toast = None
             release_camera()
             st.rerun()
 
@@ -2529,21 +2519,18 @@ def render_video_feed() -> None:
     if st.session_state.get("use_webrtc"):
         render_browser_camera_widget(playing=st.session_state.camera_running)
 
-    video_placeholder = st.empty()
-    status_placeholder = st.empty()
-
     if not st.session_state.camera_running:
         if st.session_state.get("last_frame_rgb") is not None:
-            video_placeholder.image(st.session_state.last_frame_rgb, use_container_width=True)
+            st.image(st.session_state.last_frame_rgb, use_container_width=True)
         else:
-            video_placeholder.image(
+            st.image(
                 VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
                 use_container_width=True,
             )
-        status_placeholder.info("Camera is stopped. Detection paused.")
+        st.info("Camera is stopped. Detection paused.")
         return
 
-    live_camera_fragment(video_placeholder, status_placeholder)
+    live_camera_fragment()
 
 
 def _build_forensic_display_df() -> Optional[pd.DataFrame]:
