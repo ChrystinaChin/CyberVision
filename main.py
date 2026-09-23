@@ -1458,6 +1458,42 @@ def create_blank_tile(width: int = 320, height: int = 240, label: str = "NO CAME
     return frame
 
 
+def render_frame(placeholder, rgb_array: Optional[np.ndarray]) -> None:
+    """Renders an RGB uint8 frame as an inline base64 data: URI <img>,
+    instead of placeholder.image()'s separate `/media/<hash>` HTTP GET.
+
+    `st.image` doesn't ship the pixels over the same WebSocket connection
+    as everything else on the page — it stores the bytes server-side and
+    tells the browser a *separate* media URL to fetch them from. That
+    extra request is invisible in the Python code and in the rest of the
+    UI, so anything sitting in front of the app that isn't a plain
+    pass-through reverse proxy for *every* path (a Cloudflare Tunnel with
+    only the main app route configured, a corporate proxy, a CDN caching
+    rule, etc.) can silently 404/drop just that one request while the
+    WebSocket-delivered widgets (frame counters, metrics, toasts) keep
+    working perfectly normally. The visible symptom is exactly a broken-
+    image glyph where the video should be, with the rest of the dashboard
+    looking fine — no exception, because Streamlit's own call succeeded;
+    it's the follow-up browser request that never got through.
+
+    Inlining the JPEG bytes as base64 sidesteps this categorically: the
+    frame now travels inside the same markdown payload as any other text
+    on the page, so there is nothing extra left for a proxy to forward.
+    """
+    if rgb_array is None:
+        return
+    bgr = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2BGR)
+    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+    if not ok:
+        placeholder.error("Failed to encode video frame.")
+        return
+    data_uri = "data:image/jpeg;base64," + base64.b64encode(buf).decode("ascii")
+    placeholder.markdown(
+        f'<img src="{data_uri}" style="width:100%;display:block;border-radius:12px;" />',
+        unsafe_allow_html=True,
+    )
+
+
 def construct_3x3_grid(active_frames: Dict[int, np.ndarray], tile_w: int = 320, tile_h: int = 240) -> np.ndarray:
     tiles = []
     for idx in range(9):
@@ -2566,11 +2602,11 @@ def render_video_frame(video_placeholder, status_placeholder) -> None:
 
     if not st.session_state.get("camera_running", False):
         if st.session_state.get("last_frame_rgb") is not None:
-            video_placeholder.image(st.session_state.last_frame_rgb, use_container_width=True)
+            render_frame(video_placeholder, st.session_state.last_frame_rgb)
         else:
-            video_placeholder.image(
+            render_frame(
+                video_placeholder,
                 VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
-                use_container_width=True,
             )
         status_placeholder.info("Camera is stopped. Detection paused.")
         return
@@ -2614,7 +2650,7 @@ def render_video_frame(video_placeholder, status_placeholder) -> None:
     grid_rgb = cv2.cvtColor(grid_matrix, cv2.COLOR_BGR2RGB)
     st.session_state.last_frame_rgb = grid_rgb
 
-    video_placeholder.image(grid_rgb, channels="RGB", use_container_width=True)
+    render_frame(video_placeholder, grid_rgb)
 
     if not YOLO_AVAILABLE:
         status_placeholder.warning("Ultralytics is not installed.")
@@ -2676,11 +2712,11 @@ def render_video_feed() -> None:
 
     if not st.session_state.camera_running:
         if st.session_state.get("last_frame_rgb") is not None:
-            video_placeholder.image(st.session_state.last_frame_rgb, use_container_width=True)
+            render_frame(video_placeholder, st.session_state.last_frame_rgb)
         else:
-            video_placeholder.image(
+            render_frame(
+                video_placeholder,
                 VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
-                use_container_width=True,
             )
         status_placeholder.info("Camera is stopped. Detection paused.")
         return
