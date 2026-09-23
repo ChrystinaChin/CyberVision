@@ -1718,7 +1718,7 @@ def get_yolo_debug_info() -> Dict[str, Any]:
         try:
             model = load_yolo_model()
             info["load_yolo_model() result"] = "loaded OK" if model is not None else "returned None"
-            info["load exception"] = YOLO_LOAD_ERROR or "(none)"
+            info["load exception"] = _yolo_state()["error"] or "(none)"
         except Exception as exc:
             info["load_yolo_model() result"] = "raised an exception"
             info["load exception"] = f"{type(exc).__name__}: {exc}"
@@ -1726,15 +1726,25 @@ def get_yolo_debug_info() -> Dict[str, Any]:
     return info
 
 
-YOLO_LOAD_ERROR: str = ""  # set by load_yolo_model(); read by get_yolo_load_error()
+@st.cache_resource(show_spinner=False)
+def _yolo_state() -> Dict[str, Any]:
+    # A cache_resource-backed container, NOT a plain module-level global.
+    # Streamlit re-executes this whole script top-to-bottom on almost every
+    # rerun, so a plain `YOLO_LOAD_ERROR = ""` global gets reset every time
+    # -- even though load_yolo_model() itself is cached and only runs its
+    # body once. That combination silently wiped out the real failure
+    # reason after the first rerun. Because this container is itself
+    # cache_resource'd, the SAME dict object is returned on every call
+    # (its creation runs exactly once), so mutating it persists correctly.
+    return {"error": ""}
 
 
 @st.cache_resource(show_spinner=False)
 def load_yolo_model():
-    global YOLO_LOAD_ERROR
+    state = _yolo_state()
 
     if not YOLO_AVAILABLE:
-        YOLO_LOAD_ERROR = (
+        state["error"] = (
             "The 'ultralytics' package failed to import"
             + (f" ({YOLO_IMPORT_ERROR})" if YOLO_IMPORT_ERROR else "")
             + ". Check it's in requirements.txt and installed in this environment."
@@ -1743,22 +1753,22 @@ def load_yolo_model():
 
     model_path = CONFIG["YOLO_MODEL_PATH"]
     if not os.path.exists(model_path):
-        YOLO_LOAD_ERROR = f"YOLO model file not found at: {model_path}"
+        state["error"] = f"YOLO model file not found at: {model_path}"
         return None
 
     try:
         model = YOLO(model_path)
-        YOLO_LOAD_ERROR = ""
+        state["error"] = ""
         return model
     except Exception as exc:
-        YOLO_LOAD_ERROR = f"YOLO failed to load ({type(exc).__name__}): {exc}"
+        state["error"] = f"YOLO failed to load ({type(exc).__name__}): {exc}"
         return None
 
 
 def get_yolo_load_error() -> str:
     # Make sure load has actually been attempted at least once this run.
     load_yolo_model()
-    return YOLO_LOAD_ERROR
+    return _yolo_state()["error"]
 
 
 def is_yolo_model_available() -> bool:
