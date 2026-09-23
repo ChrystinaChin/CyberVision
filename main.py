@@ -29,9 +29,11 @@ st.set_page_config(
 try:
     from ultralytics import YOLO
     YOLO_AVAILABLE = True
-except Exception:
+    YOLO_IMPORT_ERROR = ""
+except Exception as _yolo_import_exc:
     YOLO = None
     YOLO_AVAILABLE = False
+    YOLO_IMPORT_ERROR = f"{type(_yolo_import_exc).__name__}: {_yolo_import_exc}"
 
 try:
     import yara
@@ -151,6 +153,7 @@ CONFIG: Dict[str, Any] = {
     ),
     "YOLO_CONFIDENCE": 0.45,
     "YOLO_IMAGE_SIZE": 320,
+    "YOLO_EVERY_N_FRAMES": 3,  # run real inference every Nth tick; reuse last result otherwise
 }
 
 SEVERITY_STYLE = {
@@ -936,30 +939,36 @@ def build_siren_wav_base64(
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
-def play_critical_alarm(is_critical: bool) -> None:
+def update_critical_alarm(placeholder, is_critical: bool) -> None:
     """
     Keeps a siren ringing continuously for as long as severity stays CRITICAL.
 
-    Because this is called on every ~0.1s fragment tick with byte-identical
-    markup while active, Streamlit doesn't need to be told to "loop" anything
-    itself — the <audio loop> element just keeps playing across reruns. As
-    soon as this stops being called with is_critical=True (severity drops or
-    the camera stops), the element is no longer emitted and the sound stops.
+    IMPORTANT: this must only write a *new* <audio> element to `placeholder`
+    on the transition into/out of CRITICAL, not on every ~0.1s fragment tick.
+    Re-emitting the same markup every tick (the previous behaviour) makes the
+    frontend remount the element each time, so the siren restarts from 0
+    roughly 10x/second instead of looping — it sounds broken/stuttering
+    instead of ringing continuously. By only touching the placeholder on a
+    state change, the browser's native `loop` attribute is left alone to do
+    its job, and the element is simply never re-rendered while it's ringing.
     """
-    st.session_state.alarm_active = bool(is_critical) and st.session_state.sound_enabled
+    should_ring = bool(is_critical) and st.session_state.sound_enabled
+    was_ringing = st.session_state.get("alarm_active", False)
 
-    if not st.session_state.alarm_active:
-        return
+    if should_ring and not was_ringing:
+        siren_b64 = build_siren_wav_base64()
+        placeholder.markdown(
+            f"""
+            <audio autoplay loop style="display:none;">
+                <source src="data:audio/wav;base64,{siren_b64}" type="audio/wav">
+            </audio>
+            """,
+            unsafe_allow_html=True,
+        )
+    elif not should_ring and was_ringing:
+        placeholder.empty()
 
-    siren_b64 = build_siren_wav_base64()
-    st.markdown(
-        f"""
-        <audio autoplay loop style="display:none;">
-            <source src="data:audio/wav;base64,{siren_b64}" type="audio/wav">
-        </audio>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.session_state.alarm_active = should_ring
 
 
 def dispatch_hazard_alerts(severity_str: str, hazard_title: str) -> None:
@@ -1682,19 +1691,39 @@ def frame_to_base64_jpeg(frame: np.ndarray) -> str:
 # =============================================================================
 # YOLO FIRE & SMOKE DETECTION
 # =============================================================================
+YOLO_LOAD_ERROR: str = ""  # set by load_yolo_model(); read by get_yolo_load_error()
+
+
 @st.cache_resource(show_spinner=False)
 def load_yolo_model():
+    global YOLO_LOAD_ERROR
+
     if not YOLO_AVAILABLE:
+        YOLO_LOAD_ERROR = (
+            "The 'ultralytics' package failed to import"
+            + (f" ({YOLO_IMPORT_ERROR})" if YOLO_IMPORT_ERROR else "")
+            + ". Check it's in requirements.txt and installed in this environment."
+        )
         return None
 
     model_path = CONFIG["YOLO_MODEL_PATH"]
     if not os.path.exists(model_path):
+        YOLO_LOAD_ERROR = f"YOLO model file not found at: {model_path}"
         return None
 
     try:
-        return YOLO(model_path)
-    except Exception:
+        model = YOLO(model_path)
+        YOLO_LOAD_ERROR = ""
+        return model
+    except Exception as exc:
+        YOLO_LOAD_ERROR = f"YOLO failed to load ({type(exc).__name__}): {exc}"
         return None
+
+
+def get_yolo_load_error() -> str:
+    # Make sure load has actually been attempted at least once this run.
+    load_yolo_model()
+    return YOLO_LOAD_ERROR
 
 
 def is_yolo_model_available() -> bool:
@@ -2249,12 +2278,12 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
             "smoke_ratio": 0.0,
             "yara_available": YARA_AVAILABLE,
         }
-        play_critical_alarm(False)
         st.session_state.yolo_severity = "NORMAL"
         return {
             "annotated_frame": frame,
             "yolo": {"detected": False, "detections": []},
             "alert": default_alert,
+            "is_critical": False,
         }
 
     ResourceGovernor.check_resource_pressure()
@@ -2269,18 +2298,34 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
         yolo_detector = YOLOFireSmokeDetector()
         st.session_state.yolo_detector = yolo_detector
 
-    yolo_result = yolo_detector.detect(frame)
-    st.session_state.yolo_detection = yolo_result
+    frame_number = st.session_state.frames_processed
+    run_yolo_now = (
+        st.session_state.get("yolo_detection") is None
+        or frame_number % max(1, CONFIG["YOLO_EVERY_N_FRAMES"]) == 0
+    )
+
+    if run_yolo_now:
+        yolo_result = yolo_detector.detect(frame)
+        st.session_state.yolo_detection = yolo_result
+    else:
+        # Reuse the last real inference instead of re-running the model on
+        # every single 0.1s tick -- full YOLO inference is far too slow to
+        # fit in that window, and doing it anyway is what was causing the
+        # fragment to fall behind and the UI to visibly stall/fade.
+        yolo_result = st.session_state.get("yolo_detection") or {
+            "detected": False, "detections": [], "highest_confidence": 0.0,
+            "classes": [], "annotated_frame": frame,
+        }
 
     yolo_severity = yolo_detector.hazard_severity(yolo_result)
     # Exposed to the UI so the Severity card always mirrors the live YOLO result.
     st.session_state.yolo_severity = yolo_severity
 
-    if SEVERITY_STYLE[yolo_severity]["score"] > SEVERITY_STYLE[visual_result["visual_severity"]]["score"]:
-        visual_result["visual_severity"] = yolo_severity
-        if yolo_result.get("detections"):
-            first = yolo_result["detections"][0]
-            visual_result["visual_keyword"] = f"yolo_{first['class']}_{first['confidence']:.2f}"
+    # NOTE: the OpenCV color-heuristic fallback (visual_result) is kept for
+    # logging/forensics only from here on -- it is intentionally no longer
+    # allowed to escalate visual_severity past what YOLO itself reports, so
+    # ordinary lighting/gray backgrounds can no longer masquerade as "smoke"
+    # and trigger alerts/toasts on their own.
 
     candidate_hazard = (
         yolo_result.get("detected", False)
@@ -2325,14 +2370,19 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
     st.session_state.alert_history.append(alert)
     st.session_state.latest_detection = alert
 
-    # Trigger audio & hazard-card notifications on threat detection
-    hazard_title = determine_hazard_title(alert)
-    dispatch_hazard_alerts(alert["severity"], hazard_title)
+    # Alerts (toast + siren) are gated on an ACTUAL YOLO detection.
+    # verdict["severity"] can still be elevated by the OpenCV color-heuristic
+    # fallback (kept for forensic logging), but that heuristic alone must
+    # never be enough to pop a hazard toast or ring the siren -- only a real
+    # YOLO fire/smoke box does.
+    yolo_confirmed = yolo_result.get("detected", False)
+    alert_severity = yolo_severity if yolo_confirmed else "NORMAL"
 
-    # Continuous siren: checked every fragment tick (unlike the toast/beep
-    # above, this is NOT gated by the 3s cooldown), so it starts the moment
-    # severity hits CRITICAL and stops the instant it drops below CRITICAL.
-    play_critical_alarm(alert["severity"] == "CRITICAL")
+    if yolo_confirmed:
+        hazard_title = determine_hazard_title(alert)
+        dispatch_hazard_alerts(alert_severity, hazard_title)
+
+    is_critical_now = yolo_confirmed and alert_severity == "CRITICAL"
 
     if verdict["is_hazard"]:
         upload_to_google_cloud_async(frame, alert)
@@ -2341,6 +2391,7 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
         "annotated_frame": yolo_result.get("annotated_frame", frame),
         "yolo": yolo_result,
         "alert": alert,
+        "is_critical": is_critical_now,
     }
 
 
@@ -2549,6 +2600,9 @@ def render_dashboard_settings_panel() -> None:
         if st.session_state.last_error:
             st.info("Model/YARA backend notice: Active fallback running.")
 
+        if not is_yolo_model_available():
+            st.caption(f":material/error: YOLO not active — {get_yolo_load_error() or 'unknown reason'}")
+
 
 # =============================================================================
 # DASHBOARD COMPONENTS
@@ -2657,7 +2711,7 @@ def render_resource_trend_preview() -> None:
 # =============================================================================
 # LIVE VIDEO STREAM (FULL-WIDTH 3x3 MATRIX)
 # =============================================================================
-def render_video_frame(video_placeholder, status_placeholder) -> None:
+def render_video_frame(video_placeholder, status_placeholder, alarm_placeholder) -> None:
     # Evaluated every 0.1s fragment tick (see live_camera_fragment) so the
     # hazard card fades in immediately and disappears on its own once
     # CONFIG["TOAST_DISPLAY_SECONDS"] has elapsed — no early-return above
@@ -2691,17 +2745,18 @@ def render_video_frame(video_placeholder, status_placeholder) -> None:
     st.session_state.frames_processed += 1
 
     pipeline_result = run_detection_pipeline(primary_frame)
+    update_critical_alarm(alarm_placeholder, pipeline_result.get("is_critical", False))
 
     if 0 in active_frames and pipeline_result.get("annotated_frame") is not None:
         active_frames[0] = pipeline_result["annotated_frame"]
 
     grid_matrix = construct_3x3_grid(active_frames)
 
-    # Same blended severity as the Active Monitoring card (see
-    # _render_live_stats_body) — NOT yolo_severity alone — so the on-frame
-    # "STATUS:" text can't say NORMAL while a hazard toast is firing off a
-    # YARA/VLM/visual detection YOLO's own model missed.
-    severity = pipeline_result.get("alert", {}).get("severity", "NORMAL")
+    # Alerts and the on-frame status are now gated on YOLO's own result --
+    # a YARA/VLM/visual-only signal that YOLO didn't confirm is logged for
+    # forensics but no longer surfaces as a hazard here (see
+    # run_detection_pipeline's yolo_confirmed gate).
+    severity = st.session_state.get("yolo_severity", "NORMAL")
 
     yolo_result = pipeline_result.get("yolo", {})
     yolo_status = "DETECTED" if yolo_result.get("detected") else "CLEAR"
@@ -2733,8 +2788,8 @@ def render_video_frame(video_placeholder, status_placeholder) -> None:
 
 
 @st.fragment(run_every=0.1)
-def live_camera_fragment(video_container, status_container):
-    render_video_frame(video_container, status_container)
+def live_camera_fragment(video_container, status_container, alarm_container):
+    render_video_frame(video_container, status_container, alarm_container)
 
 
 def render_video_feed() -> None:
@@ -2778,6 +2833,7 @@ def render_video_feed() -> None:
 
     video_placeholder = st.empty()
     status_placeholder = st.empty()
+    alarm_placeholder = st.empty()
 
     # Both placeholders must be WRITTEN TO at least once during this normal
     # (non-fragment) run before live_camera_fragment below can claim a
@@ -2802,11 +2858,12 @@ def render_video_feed() -> None:
     status_placeholder.info(
         "Starting camera..." if st.session_state.camera_running else "Camera is stopped. Detection paused."
     )
+    alarm_placeholder.markdown("<!-- alarm -->", unsafe_allow_html=True)
 
     if not st.session_state.camera_running:
         return
 
-    live_camera_fragment(video_placeholder, status_placeholder)
+    live_camera_fragment(video_placeholder, status_placeholder, alarm_placeholder)
 
 
 def _build_forensic_display_df() -> Optional[pd.DataFrame]:
