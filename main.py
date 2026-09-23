@@ -2769,15 +2769,31 @@ def render_video_feed() -> None:
     video_placeholder = st.empty()
     status_placeholder = st.empty()
 
+    # Both placeholders must be WRITTEN TO at least once during this normal
+    # (non-fragment) run before live_camera_fragment below can claim a
+    # stable position in them for its own repeated writes — st.empty() only
+    # reserves a layout slot, it doesn't count as a write. Skipping this
+    # write whenever camera_running was already True (e.g. right after
+    # Start) is what raised StreamlitInvalidLayoutContextError: "container
+    # was not written to during the initial run". So render an initial
+    # frame/status unconditionally, for both the stopped and the
+    # just-started case, before deciding whether to hand the placeholders
+    # off to the fragment.
+    if st.session_state.get("last_frame_rgb") is not None:
+        render_frame(video_placeholder, st.session_state.last_frame_rgb)
+    else:
+        render_frame(
+            video_placeholder,
+            VideoCaptureManager.placeholder_frame(
+                "Starting camera..." if st.session_state.camera_running else "Camera Stopped",
+                "Connecting to feed..." if st.session_state.camera_running else "Click Start to begin monitoring.",
+            ),
+        )
+    status_placeholder.info(
+        "Starting camera..." if st.session_state.camera_running else "Camera is stopped. Detection paused."
+    )
+
     if not st.session_state.camera_running:
-        if st.session_state.get("last_frame_rgb") is not None:
-            render_frame(video_placeholder, st.session_state.last_frame_rgb)
-        else:
-            render_frame(
-                video_placeholder,
-                VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
-            )
-        status_placeholder.info("Camera is stopped. Detection paused.")
         return
 
     live_camera_fragment(video_placeholder, status_placeholder)
