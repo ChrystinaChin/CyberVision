@@ -82,11 +82,6 @@ def is_cloud_environment() -> bool:
     no physical camera device attached, so cv2.VideoCapture can never work
     there and the app should fall back to capturing the visitor's own
     browser camera over WebRTC instead.
-
-    Order of checks:
-    1. Explicit manual override via env vars (useful for testing either path).
-    2. Streamlit Community Cloud checks the repo out under /mount/src/<repo>.
-    3. Streamlit Community Cloud containers run as the "appuser" user.
     """
     force_webrtc = os.environ.get("CYBERVISION_FORCE_WEBRTC", "").strip().lower()
     if force_webrtc in ("1", "true", "yes"):
@@ -106,9 +101,7 @@ def is_cloud_environment() -> bool:
 
 
 def local_camera_available() -> bool:
-    """Best-effort probe for a real, locally-attached camera device. Used as
-    a fallback signal in case is_cloud_environment() doesn't recognize the
-    hosting platform but no local camera actually exists."""
+    """Best-effort probe for a real, locally-attached camera device."""
     try:
         probe = cv2.VideoCapture(CONFIG["CAMERA_SOURCES"][0])
         opened = probe.isOpened()
@@ -139,10 +132,7 @@ CONFIG: Dict[str, Any] = {
     "LATENCY_HISTORY_MAX": 100,
     "TOAST_DISPLAY_SECONDS": 6.0,
     "YARA_RULE_PATH": "hazard_rules.yar",
-    # Fill these in with your real GCS bucket + GCP project — cloud backup
-    # stays disabled (silently, by design) as long as GCP_BUCKET is left at
-    # this placeholder. See _get_gcp_service_account_info() for how
-    # credentials are supplied (Streamlit secrets / env var / local key file).
+    # GCP Credentials & Bucket Configuration
     "GCP_BUCKET": "cybervision_history",
     "GCP_PROJECT_ID": "c5c505d599a4735f61c6c6896dd3f47a2c28337b",
     "DB_FILE": "cybervision_buffer.db",
@@ -152,8 +142,8 @@ CONFIG: Dict[str, Any] = {
         "YOLO_dataset.pt",
     ),
     "YOLO_CONFIDENCE": 0.45,
-    "YOLO_IMAGE_SIZE": 320,
-    "YOLO_EVERY_N_FRAMES": 3,  # run real inference every Nth tick; reuse last result otherwise
+    "YOLO_IMAGE_SIZE": 160,       # Reduced from 320 to accelerate CPU inference
+    "YOLO_EVERY_N_FRAMES": 6,     # Run real inference every 6th tick; reuse last result otherwise
 }
 
 SEVERITY_STYLE = {
@@ -285,10 +275,6 @@ def init_session_state() -> None:
             st.session_state[key] = value
 
     if "use_webrtc" not in st.session_state:
-        # Decide once per session which capture path to use: browser WebRTC
-        # (needed on hosted platforms with no physical camera) or the local
-        # cv2.VideoCapture multi-camera path (for running on a machine that
-        # actually has camera hardware attached, e.g. local development).
         needs_browser_camera = is_cloud_environment() or not local_camera_available()
         st.session_state.use_webrtc = needs_browser_camera and WEBRTC_AVAILABLE
         st.session_state.webrtc_unavailable_on_cloud = needs_browser_camera and not WEBRTC_AVAILABLE
@@ -313,6 +299,14 @@ def inject_custom_css() -> None:
                 radial-gradient(circle at top left, rgba(249,115,22,0.18), transparent 32%),
                 linear-gradient(135deg, {bg} 0%, #ffffff 45%, #fff1e6 100%) !important;
             color: {text} !important;
+        }}
+
+        /* PREVENT FRAGMENT DIMMING / FADING OUT ON UPDATE */
+        div[data-testid="stFragment"],
+        [data-testid="stFragment"] > div {{
+            opacity: 1 !important;
+            transition: opacity 0s !important;
+            filter: none !important;
         }}
 
         .main .block-container {{
@@ -415,10 +409,6 @@ def inject_custom_css() -> None:
             font-size: 1.25rem !important;
         }}
 
-        /* Delta badges (the little rounded "↑ of 1" / "↑ ⚠" pill under a
-           metric) default to Streamlit's green/red — flatten that to a
-           neutral, slightly transparent grey. The CPU/RAM "_high" rules
-           further down are more specific and still turn red on alert. */
         div[data-testid="stMetricDelta"] {{
             background: rgba(107, 114, 128, 0.12) !important;
             border-radius: 999px !important;
@@ -450,30 +440,8 @@ def inject_custom_css() -> None:
             transform: translateY(-1px);
         }}
 
-        /* ---------------------------------------------------------------
-           HAZARD TOAST — a fully custom fixed-position card (rendered by
-           render_custom_hazard_toast via plain st.markdown), NOT st.toast.
-
-           st.toast has its own internal height clamp that silently cuts
-           off longer messages (the action line / timestamp vanished with
-           no scrollbar or ellipsis) and no stylesheet override — however
-           specific, however many !important — could reach it, because
-           that clamp lives in Streamlit's own component state rather
-           than in plain overridable CSS. Owning the markup outright
-           sidesteps that entirely: nothing here can silently truncate.
-        --------------------------------------------------------------- */
         .hazard-toast {{
             position: fixed;
-            /* Streamlit's own header/toolbar (the "Share" / "⋮" bar,
-               [data-testid="stHeader"]) renders in its own stacking context
-               with a z-index far above ours (Streamlit uses six-figure
-               values like 999990+ for it). At top:1.1rem the toast's top
-               edge sat underneath that bar, so its gradient background
-               visually blended with the toast's text and made it unreadable
-               even though the toast itself was fully rendered. Two
-               independent fixes, applied together so this can't regress
-               either way: clear the header's height outright (~3.7rem is
-               Streamlit's default header height) AND out-rank its z-index. */
             top: 4.5rem;
             right: 1.1rem;
             z-index: 1000000;
@@ -529,7 +497,6 @@ def inject_custom_css() -> None:
             margin-top: 0.45rem;
         }}
 
-        /* Tighten tab bar spacing so the video grid sits closer to it */
         .stTabs {{
             margin-top: -0.3rem !important;
         }}
@@ -542,14 +509,6 @@ def inject_custom_css() -> None:
             padding-top: 0.4rem !important;
         }}
 
-        /* -----------------------------------------------------------
-           SIDEBAR WORKSPACE NAVIGATION
-        ----------------------------------------------------------- */
-        /* Sidebar layout: turn every element between the sidebar root and
-           the account block into a flex column that fills the sidebar's
-           height. The account block then uses margin-top:auto to sit at the
-           very bottom. (":has" is used so this works no matter how many
-           wrapper divs a given Streamlit version puts around the block.) */
         [data-testid="stSidebarContent"] {{
             display: flex !important;
             flex-direction: column !important;
@@ -567,9 +526,6 @@ def inject_custom_css() -> None:
             padding-bottom: 0.6rem !important;
         }}
 
-        /* Google account card + Log out button: pinned to the bottom edge.
-           "sticky" keeps it visible if the nav list ever grows tall enough
-           for the sidebar to scroll. */
         .st-key-sidebar_bottom_block {{
             margin-top: auto !important;
             flex: 0 0 auto !important;
@@ -658,10 +614,6 @@ def inject_custom_css() -> None:
             margin: 1.2rem 0 0.9rem 0;
         }}
 
-        /* -----------------------------------------------------------
-           RESOURCE METRICS — CPU / RAM turn red once they cross the
-           configured warning threshold.
-        ----------------------------------------------------------- */
         .st-key-cpu_metric_high [data-testid="stMetricValue"],
         .st-key-ram_metric_high [data-testid="stMetricValue"],
         .st-key-cpu_metric_high [data-testid="stMetricDelta"],
@@ -674,10 +626,6 @@ def inject_custom_css() -> None:
             fill: #ff3b30 !important;
         }}
 
-        /* -----------------------------------------------------------
-           SEVERITY METRIC — colour follows the YOLO severity:
-           NORMAL = green, MEDIUM = yellow, HIGH / CRITICAL = red.
-        ----------------------------------------------------------- */
         .st-key-severity_metric_normal [data-testid="stMetricValue"],
         .st-key-severity_metric_normal [data-testid="stMetricValue"] * {{
             color: #16a34a !important;
@@ -767,9 +715,6 @@ def inject_custom_css() -> None:
             text-overflow: ellipsis;
         }}
 
-        /* -----------------------------------------------------------
-           DASHBOARD HEADER + LIVE STATUS PILL
-        ----------------------------------------------------------- */
         .dash-header {{
             display: flex;
             align-items: center;
@@ -823,9 +768,6 @@ def inject_custom_css() -> None:
             border-radius: 50%;
         }}
 
-        /* -----------------------------------------------------------
-           CARD PANELS (video panel, stats side panel)
-        ----------------------------------------------------------- */
         [data-testid="stVerticalBlockBorderWrapper"] {{
             background: rgba(255,255,255,0.94) !important;
             border: 1px solid {border} !important;
@@ -855,9 +797,6 @@ def inject_custom_css() -> None:
             color: {accent_dark};
         }}
 
-        /* WebRTC transport is intentionally invisible. The dashboard's
-           Start button is the only user-facing camera control and the custom
-           3x3 matrix is the only visible camera feed. */
         .st-key-webrtc_transport {{
             height: 0 !important;
             min-height: 0 !important;
@@ -900,7 +839,6 @@ def build_beep_wav_base64(duration: float = 0.35, freq: int = 1050, sample_rate:
 
 
 def play_alert_sound() -> None:
-    """Embeds robust auto-playing HTML5 audio element into Streamlit canvas."""
     if not st.session_state.sound_enabled:
         return
 
@@ -919,7 +857,6 @@ def build_siren_wav_base64(
     high_freq: int = 1500,
     sample_rate: int = 44100,
 ) -> str:
-    """Alternating two-tone siren clip used for the continuous CRITICAL alarm."""
     segment_len = max(1, int(sample_rate * duration / 4))
     t_seg = np.linspace(0, duration / 4, segment_len, False)
 
@@ -940,18 +877,6 @@ def build_siren_wav_base64(
 
 
 def update_critical_alarm(placeholder, is_critical: bool) -> None:
-    """
-    Keeps a siren ringing continuously for as long as severity stays CRITICAL.
-
-    IMPORTANT: this must only write a *new* <audio> element to `placeholder`
-    on the transition into/out of CRITICAL, not on every ~0.1s fragment tick.
-    Re-emitting the same markup every tick (the previous behaviour) makes the
-    frontend remount the element each time, so the siren restarts from 0
-    roughly 10x/second instead of looping — it sounds broken/stuttering
-    instead of ringing continuously. By only touching the placeholder on a
-    state change, the browser's native `loop` attribute is left alone to do
-    its job, and the element is simply never re-rendered while it's ringing.
-    """
     should_ring = bool(is_critical) and st.session_state.sound_enabled
     was_ringing = st.session_state.get("alarm_active", False)
 
@@ -972,22 +897,16 @@ def update_critical_alarm(placeholder, is_critical: bool) -> None:
 
 
 def dispatch_hazard_alerts(severity_str: str, hazard_title: str) -> None:
-    """Show a single fire/smoke alert in the requested notification format."""
     severity_norm = str(severity_str).strip().upper()
 
     if severity_norm not in ["MEDIUM", "HIGH", "CRITICAL"]:
         return
 
     now = time.time()
-
-    # Cooldown period of 3 seconds between continuous notification bursts.
     if now - st.session_state.get("last_triggered_alert_ts", 0) <= 3.0:
         return
 
     st.session_state.last_triggered_alert_ts = now
-
-    # IMPORTANT: never display "Fire & Smoke Detected".
-    # The detector resolves the notification to exactly ONE hazard type.
     hazard_norm = str(hazard_title).strip().upper()
 
     if "FIRE" in hazard_norm:
@@ -1001,13 +920,6 @@ def dispatch_hazard_alerts(severity_str: str, hazard_title: str) -> None:
     action_line = "Please evacuate from the area immediately."
     checked_time = datetime.now().strftime("%H:%M:%S")
 
-    # Rendered by render_custom_hazard_toast() as a plain fixed-position
-    # HTML card, NOT st.toast — st.toast has its own internal height
-    # clamp that silently cut off the action line / timestamp on longer
-    # messages, and no CSS override (however specific) could reach it
-    # since that clamp lives in Streamlit's own component state rather
-    # than in plain stylesheet-overridable CSS. Storing the fields here
-    # and rendering them ourselves sidesteps that entirely.
     st.session_state.active_hazard_toast = {
         "severity": severity_norm,
         "alert_title": alert_title,
@@ -1017,18 +929,11 @@ def dispatch_hazard_alerts(severity_str: str, hazard_title: str) -> None:
         "triggered_at": now,
     }
 
-    # CRITICAL gets the continuous siren (played elsewhere, every pipeline
-    # tick, independent of this 3s toast cooldown) — no need to also fire
-    # the short one-off beep here, which would just overlap it.
     if severity_norm != "CRITICAL":
         play_alert_sound()
 
 
 def render_custom_hazard_toast() -> None:
-    """Renders the most recent fire/smoke alert (see dispatch_hazard_alerts)
-    as a fixed top-right card for CONFIG["TOAST_DISPLAY_SECONDS"], then
-    stops rendering it — a self-expiring notification with none of
-    st.toast's baked-in truncation."""
     toast_data = st.session_state.get("active_hazard_toast")
     if not toast_data:
         return
@@ -1047,8 +952,6 @@ def render_custom_hazard_toast() -> None:
         """,
         unsafe_allow_html=True,
     )
-
-
 
 
 # =============================================================================
@@ -1112,18 +1015,12 @@ class ResourceGovernor:
 
 
 # =============================================================================
-# BROWSER CAMERA (WEBRTC) — used on hosted deployments with no physical
-# camera attached (e.g. Streamlit Community Cloud). Captures the visitor's
-# own device camera in the browser and streams frames to the server.
+# BROWSER CAMERA (WEBRTC)
 # =============================================================================
 if WEBRTC_AVAILABLE:
     from streamlit_webrtc import VideoHTMLAttributes
 
     class BrowserCameraProcessor(VideoProcessorBase):
-        """Stores only the most recent frame received from the browser so the
-        0.1s detection fragment can grab it without blocking on the media
-        stream itself."""
-
         def __init__(self) -> None:
             self._lock = threading.Lock()
             self._latest_frame: Optional[np.ndarray] = None
@@ -1143,7 +1040,6 @@ else:
 
 
 def _get_secret(name: str) -> Optional[str]:
-    """Read a credential from env vars first, then Streamlit secrets."""
     value = os.environ.get(name)
     if value:
         return value
@@ -1161,7 +1057,7 @@ def _get_cloudflare_turn_credentials() -> Tuple[Optional[str], Optional[str]]:
 
 def _get_metered_credentials() -> Tuple[Optional[str], Optional[str]]:
     api_key = _get_secret("METERED_API_KEY")
-    domain = _get_secret("METERED_DOMAIN")  # e.g. "your-app.metered.live"
+    domain = _get_secret("METERED_DOMAIN")
     return api_key, domain
 
 
@@ -1169,21 +1065,6 @@ def _get_metered_credentials() -> Tuple[Optional[str], Optional[str]]:
 # GOOGLE CLOUD CREDENTIALS
 # =============================================================================
 def _get_gcp_service_account_info() -> Optional[dict]:
-    """Resolve GCP service-account credentials without depending on a JSON
-    key file being present inside the deployed container (Streamlit
-    Community Cloud has no way to receive that file securely — anything
-    committed to the repo is public). Checked in order:
-
-    1. GCP_SERVICE_ACCOUNT_JSON env var — the whole key file contents as a
-       single string. Handy for Docker/VM deployments where secrets are
-       injected as environment variables.
-    2. st.secrets["gcp_service_account"] — a [gcp_service_account] TOML
-       table pasted into Streamlit Cloud's Secrets manager. This is the
-       recommended path for Streamlit Community Cloud.
-    3. A local service_account.json file next to this script — convenient
-       for local development only. Never commit this file to git; keep it
-       out of the repo (.gitignore) since it's a plaintext credential.
-    """
     raw = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
     if raw:
         try:
@@ -1212,14 +1093,6 @@ def _get_gcp_service_account_info() -> Optional[dict]:
 
 @st.cache_resource(show_spinner=False)
 def get_gcp_clients() -> Tuple[Optional[Any], Optional[Any]]:
-    """Cached (storage_client, firestore_client) pair, built once per
-    session. Prefers an explicit service-account key from
-    _get_gcp_service_account_info() (env var, Streamlit secrets, or a local
-    file); falls back to Application Default Credentials, which only work
-    when running on GCP infrastructure (GCE/Cloud Run) or after a local
-    `gcloud auth application-default login` — NOT on Streamlit Community
-    Cloud. Returns (None, None) if neither the library nor any credentials
-    are available, so every caller must check before using the result."""
     if not GCP_AVAILABLE:
         return None, None
 
@@ -1241,24 +1114,10 @@ def get_gcp_clients() -> Tuple[Optional[Any], Optional[Any]]:
 
 
 STUN_ONLY_ICE_SERVERS = [{"urls": ["stun:stun.l.google.com:19302"]}]
-
-
-# Module-level (not st.session_state) because get_ice_servers() below is
-# @st.cache_data'd with no arguments: it only *executes* the first time it's
-# called within the TTL window, and every other session just gets the
-# cached return value without this code running again. session_state
-# writes here would therefore only ever reach whichever session happened
-# to trigger the real fetch. This dict is purely a best-effort debug
-# surface (see the "Server Setup" panel) for "which tier did we actually
-# get, and why" — it is not used for any connection logic.
 ICE_SERVER_DIAGNOSTICS: Dict[str, str] = {"tier": "unknown", "detail": ""}
 
 
 def _fetch_cloudflare_ice_servers(key_id: str, api_token: str) -> Optional[list]:
-    """Mints a short-lived (24h TTL) TURN credential via Cloudflare's
-    Realtime TURN API. The long-lived API token stays server-side; only the
-    generated username/credential pair is handed to the browser. See
-    https://developers.cloudflare.com/realtime/turn/generate-credentials/"""
     if not REQUESTS_AVAILABLE:
         ICE_SERVER_DIAGNOSTICS["detail"] = "`requests` package is not installed/importable."
         return None
@@ -1274,15 +1133,6 @@ def _fetch_cloudflare_ice_servers(key_id: str, api_token: str) -> Optional[list]
         )
         resp.raise_for_status()
         ice_servers = resp.json().get("iceServers") or []
-        # Cloudflare may return an alternate port-53 URL. Browsers can block
-        # that port, while the same response contains other TURN transports.
-        # NOTE: must match port 53 EXACTLY (":53" at the end, or right before
-        # a "?transport=..." suffix). A plain substring check ("':53' in u")
-        # also matches ":5349" (TURNS/TLS) and would silently strip that
-        # entry too, quietly removing one of the two firewall-friendly
-        # relay transports (leaving only the 443 TURNS fallback) and making
-        # already-marginal networks that much more likely to never get past
-        # "Waiting for first frame from browser camera...".
         port_53_pattern = re.compile(r":53(?:\?|$)")
         filtered = []
         for server in ice_servers:
@@ -1306,9 +1156,6 @@ def _fetch_cloudflare_ice_servers(key_id: str, api_token: str) -> Optional[list]
 
 
 def _fetch_metered_ice_servers(api_key: str, domain: str) -> Optional[list]:
-    """Metered.ca / Open Relay Project TURN credentials — a free alternative
-    that needs only an API key + your Metered subdomain, no Twilio-style
-    account. See https://www.metered.ca/tools/openrelay/"""
     if not REQUESTS_AVAILABLE:
         ICE_SERVER_DIAGNOSTICS["detail"] = "`requests` package is not installed/importable."
         return None
@@ -1327,51 +1174,10 @@ def _fetch_metered_ice_servers(api_key: str, domain: str) -> Optional[list]:
 
 
 def get_ice_servers() -> list:
-    """Three-tier ICE server strategy, cheapest/simplest first:
-
-    1. Google's free public STUN server (STUN_ONLY_ICE_SERVERS) — zero setup,
-       works fine when the network path between browser and server allows
-       direct/STUN-negotiated UDP. This is what's used if neither TURN
-       option below is configured, and is always the final fallback.
-    2. Cloudflare Realtime TURN (recommended by the streamlit-webrtc
-       maintainers for platforms like Streamlit Community Cloud, whose
-       firewall blocks plain STUN-negotiated connections) — used when
-       CLOUDFLARE_TURN_KEY_ID / CLOUDFLARE_TURN_KEY_API_TOKEN are configured
-       (env vars or Streamlit secrets).
-    3. Metered.ca / Open Relay Project — a free TURN alternative, used when
-       METERED_API_KEY / METERED_DOMAIN are configured instead of Cloudflare.
-
-    Whichever TURN tier is configured takes priority over plain STUN, since
-    STUN alone is the one most likely to leave the stream stuck at
-    "Waiting for first frame" on a hosted platform.
-
-    Cached in st.session_state (NOT @st.cache_data): a process-wide cache
-    here means every visitor, and every reconnect from the SAME visitor
-    (e.g. a plain browser refresh, which always tears down and rebuilds
-    the browser-side RTCPeerConnection from scratch) would be handed the
-    exact same TURN username/credential pair for as long as the cache TTL
-    lasts. Two independent WebRTC sessions racing to open allocations on
-    one shared credential is a plausible way for a connection that worked
-    a minute ago to fail right after a refresh, and it's indistinguishable
-    from the browser side from any other ICE failure — it just looks like
-    "stuck at Waiting for first frame" again. Keying the cache off
-    st.session_state instead gives every new session (hence every refresh)
-    its own freshly-minted credential, while still only paying for one
-    network round-trip per session for the ttl_seconds below.
-    """
     cache_key = "_ice_servers_cache"
     diag_key = "_ice_server_diagnostics_cache"
     ttl_seconds = 3000
 
-    # ICE_SERVER_DIAGNOSTICS is a module-level dict, but Streamlit re-runs
-    # this entire script top-to-bottom on every interaction, which re-runs
-    # the `ICE_SERVER_DIAGNOSTICS: Dict[str, str] = {...}` assignment at
-    # module scope too and wipes out whatever the last real check found.
-    # Combined with the st.session_state cache below (which DOES survive
-    # reruns), that made the "Last-fetch detail" caption go blank on every
-    # rerun after the one that actually performed the fetch — hiding the
-    # real reason for any STUN fallback. Restore it from session_state,
-    # which is rerun-safe, before doing anything else.
     if diag_key in st.session_state:
         ICE_SERVER_DIAGNOSTICS.update(st.session_state[diag_key])
 
@@ -1408,15 +1214,6 @@ def get_ice_servers() -> list:
 
 
 def _describe_ice_servers(ice_servers: list) -> str:
-    """Builds the 'Browser camera relay: ...' caption directly from the
-    actual ICE server list this render is using — NOT from the
-    ICE_SERVER_DIAGNOSTICS side-effect dict, which only gets touched
-    inside get_ice_servers()'s body and can look stale ("not yet
-    determined") across the fragment/rerun boundaries this panel sits
-    behind. Deriving the caption straight from the object already in hand
-    can't go stale: it's always describing exactly what this page load's
-    WebRTC connection was configured with.
-    """
     urls: list = []
     has_turn_credential = False
     for server in ice_servers:
@@ -1442,26 +1239,6 @@ def _describe_ice_servers(ice_servers: list) -> str:
 
 
 def render_browser_camera_widget(playing: bool) -> None:
-    """Mounts the WebRTC component ONCE PER PAGE RENDER, unconditionally
-    (same tree position on every run, whether the camera is running or
-    stopped). Toggling `desired_playing_state` — rather than conditionally
-    including/excluding this call — is the documented way to start/stop the
-    stream without remounting it.
-
-    This matters: streamlit-webrtc is a stateful, bidirectional component,
-    so its own connection-state changes trigger extra full-script reruns.
-    If it were only mounted while camera_running (changing the element tree
-    shape between runs), those reruns desync Streamlit's element
-    reconciliation for anything rendered after it in the tree — including
-    the video_placeholder the 0.1s fragment writes into. Symptom: frame/
-    hazard counters keep incrementing (the Python side is fine) but nothing
-    visibly updates until Stop is pressed and a plain, non-fragment render
-    path takes over. Keeping this call unconditional avoids that entirely.
-
-    The native local-preview <video> element is hidden via CSS (our own
-    3x3 grid is the visible feed) — hiding it doesn't stop the underlying
-    track, so frames still reach BrowserCameraProcessor.recv() normally.
-    """
     if not WEBRTC_AVAILABLE:
         if playing:
             st.error(
@@ -1472,10 +1249,6 @@ def render_browser_camera_widget(playing: bool) -> None:
             )
         return
 
-    # WebRTC is transport-only. Keep it mounted at one stable location so
-    # its state is not duplicated, but hide its native preview/controls. The
-    # dashboard Start/Stop buttons control `desired_playing_state`, and the
-    # custom 3x3 matrix below is the only visible camera feed.
     with st.container(key="webrtc_transport"):
         ctx = webrtc_streamer(
             key="cybervision-browser-camera",
@@ -1494,7 +1267,7 @@ def render_browser_camera_widget(playing: bool) -> None:
 
 
 # =============================================================================
-# MULTI-CAMERA HANDLING & 3x3 MATRIX (local cv2 devices only)
+# MULTI-CAMERA HANDLING & 3x3 MATRIX
 # =============================================================================
 @st.cache_resource(show_spinner=False)
 def get_camera_caps() -> Dict[int, cv2.VideoCapture]:
@@ -1513,9 +1286,6 @@ def get_camera_caps() -> Dict[int, cv2.VideoCapture]:
 
 def release_camera() -> None:
     if st.session_state.get("use_webrtc"):
-        # Nothing to release server-side; the browser owns the camera device
-        # and tears its own stream down when the webrtc component unmounts
-        # or permission is revoked.
         return
     try:
         caps = get_camera_caps()
@@ -1540,27 +1310,6 @@ def create_blank_tile(width: int = 320, height: int = 240, label: str = "NO CAME
 
 
 def render_frame(placeholder, rgb_array: Optional[np.ndarray]) -> None:
-    """Renders an RGB uint8 frame as an inline base64 data: URI <img>,
-    instead of placeholder.image()'s separate `/media/<hash>` HTTP GET.
-
-    `st.image` doesn't ship the pixels over the same WebSocket connection
-    as everything else on the page — it stores the bytes server-side and
-    tells the browser a *separate* media URL to fetch them from. That
-    extra request is invisible in the Python code and in the rest of the
-    UI, so anything sitting in front of the app that isn't a plain
-    pass-through reverse proxy for *every* path (a Cloudflare Tunnel with
-    only the main app route configured, a corporate proxy, a CDN caching
-    rule, etc.) can silently 404/drop just that one request while the
-    WebSocket-delivered widgets (frame counters, metrics, toasts) keep
-    working perfectly normally. The visible symptom is exactly a broken-
-    image glyph where the video should be, with the rest of the dashboard
-    looking fine — no exception, because Streamlit's own call succeeded;
-    it's the follow-up browser request that never got through.
-
-    Inlining the JPEG bytes as base64 sidesteps this categorically: the
-    frame now travels inside the same markdown payload as any other text
-    on the page, so there is nothing extra left for a proxy to forward.
-    """
     if rgb_array is None:
         return
     bgr = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2BGR)
@@ -1604,10 +1353,6 @@ class VideoCaptureManager:
 
     @staticmethod
     def _capture_from_browser() -> Tuple[Dict[int, np.ndarray], Optional[np.ndarray]]:
-        # Only CAM_01 is real here — a browser only exposes the visitor's own
-        # device camera(s), never a bank of 9 independent sources, so the
-        # other grid tiles stay in their "NO CAMERA DETECTED" placeholder
-        # state. Detection still runs off this single live feed.
         ctx = st.session_state.get("webrtc_ctx")
         if ctx is None or ctx.video_processor is None:
             st.session_state.last_error = "Waiting for browser camera permission..."
@@ -1692,8 +1437,6 @@ def frame_to_base64_jpeg(frame: np.ndarray) -> str:
 # YOLO FIRE & SMOKE DETECTION
 # =============================================================================
 def get_yolo_debug_info() -> Dict[str, Any]:
-    """Raw, unambiguous facts about why YOLO is or isn't active -- always
-    populated, never falls back to a vague 'unknown reason'."""
     model_path = CONFIG["YOLO_MODEL_PATH"]
     model_dir = os.path.dirname(model_path)
 
@@ -1728,14 +1471,6 @@ def get_yolo_debug_info() -> Dict[str, Any]:
 
 @st.cache_resource(show_spinner=False)
 def _yolo_state() -> Dict[str, Any]:
-    # A cache_resource-backed container, NOT a plain module-level global.
-    # Streamlit re-executes this whole script top-to-bottom on almost every
-    # rerun, so a plain `YOLO_LOAD_ERROR = ""` global gets reset every time
-    # -- even though load_yolo_model() itself is cached and only runs its
-    # body once. That combination silently wiped out the real failure
-    # reason after the first rerun. Because this container is itself
-    # cache_resource'd, the SAME dict object is returned on every call
-    # (its creation runs exactly once), so mutating it persists correctly.
     return {"error": ""}
 
 
@@ -1766,7 +1501,6 @@ def load_yolo_model():
 
 
 def get_yolo_load_error() -> str:
-    # Make sure load has actually been attempted at least once this run.
     load_yolo_model()
     return _yolo_state()["error"]
 
@@ -1967,7 +1701,7 @@ class VisualFireSmokeDetector:
 
 
 # =============================================================================
-# OLLAMA VLM INFERENCE (THREAD-SAFE ASYNC NON-BLOCKING)
+# OLLAMA VLM INFERENCE
 # =============================================================================
 class VLMInference:
     @staticmethod
@@ -2123,12 +1857,6 @@ class YARAVerifier:
 # GOOGLE CLOUD FORENSIC BACKUP & LOCAL BUFFER
 # =============================================================================
 def _queue_image_for_later_upload(frame: np.ndarray, alert: Dict[str, Any]) -> None:
-    """
-    Buffers a frame + its alert metadata to local disk so it can be pushed
-    to the GCS bucket once network connectivity returns. This mirrors the
-    SQLite buffer used for the text alert log, but for the image/JSON pair
-    that upload_to_google_cloud_async otherwise sends immediately.
-    """
     try:
         pending_dir = CONFIG["PENDING_UPLOADS_DIR"]
         os.makedirs(pending_dir, exist_ok=True)
@@ -2151,12 +1879,6 @@ def _queue_image_for_later_upload(frame: np.ndarray, alert: Dict[str, Any]) -> N
 
 
 def flush_pending_cloud_uploads() -> None:
-    """
-    Drains the local image/alert buffer to the GCS bucket. Called from
-    sync_worker_loop only when is_wifi_connected() is already True, so this
-    never attempts network I/O while offline. Files that fail to upload are
-    left in place and retried on the next pass (every ~10s).
-    """
     if not GCP_AVAILABLE or storage is None:
         return
     if CONFIG["GCP_BUCKET"] == "your-gcp-bucket-name":
@@ -2200,14 +1922,11 @@ def flush_pending_cloud_uploads() -> None:
 
             os.remove(image_path)
         except Exception:
-            # Leave both files in place — retried automatically next pass.
             continue
 
 
 def upload_to_google_cloud_async(frame: np.ndarray, alert: Dict[str, Any]) -> None:
     def _worker():
-        # Always logged locally first, regardless of network or cloud_sync
-        # settings — this is the source of truth until it's synced.
         save_event_locally(
             time.time(),
             alert.get("severity", "UNKNOWN"),
@@ -2221,10 +1940,6 @@ def upload_to_google_cloud_async(frame: np.ndarray, alert: Dict[str, Any]) -> No
         if CONFIG["GCP_BUCKET"] == "your-gcp-bucket-name":
             return
 
-        # Offline-first: only attempt the live upload when there's actually
-        # network. If offline (or the upload fails mid-flight), buffer the
-        # frame + alert locally so flush_pending_cloud_uploads() can retry
-        # it once connectivity returns — nothing gets silently dropped.
         if not is_wifi_connected():
             _queue_image_for_later_upload(frame, alert)
             return
@@ -2261,7 +1976,6 @@ def upload_to_google_cloud_async(frame: np.ndarray, alert: Dict[str, Any]) -> No
 # HELPER FUNCTIONS
 # =============================================================================
 def determine_hazard_title(latest: Dict[str, Any]) -> str:
-    """Resolve the alert to exactly one hazard type: FIRE or SMOKE."""
     if not latest or latest.get("severity") == "NORMAL":
         return "Environment is Safe"
 
@@ -2283,15 +1997,11 @@ def determine_hazard_title(latest: Dict[str, Any]) -> str:
         or latest.get("smoke_ratio", 0) > 0.10
     )
 
-    # Fire takes priority if both signals are present. This guarantees that
-    # the user-facing notification NEVER says "Fire & Smoke Detected".
     if has_fire:
         return "Fire Detected"
     if has_smoke:
         return "Smoke Detected"
 
-    # If the severity is hazardous but the source does not identify the type,
-    # use the VLM description when possible; otherwise default to smoke.
     if "fire" in description or "fire" in keyword:
         return "Fire Detected"
 
@@ -2353,24 +2063,13 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
         yolo_result = yolo_detector.detect(frame)
         st.session_state.yolo_detection = yolo_result
     else:
-        # Reuse the last real inference instead of re-running the model on
-        # every single 0.1s tick -- full YOLO inference is far too slow to
-        # fit in that window, and doing it anyway is what was causing the
-        # fragment to fall behind and the UI to visibly stall/fade.
         yolo_result = st.session_state.get("yolo_detection") or {
             "detected": False, "detections": [], "highest_confidence": 0.0,
             "classes": [], "annotated_frame": frame,
         }
 
     yolo_severity = yolo_detector.hazard_severity(yolo_result)
-    # Exposed to the UI so the Severity card always mirrors the live YOLO result.
     st.session_state.yolo_severity = yolo_severity
-
-    # NOTE: the OpenCV color-heuristic fallback (visual_result) is kept for
-    # logging/forensics only from here on -- it is intentionally no longer
-    # allowed to escalate visual_severity past what YOLO itself reports, so
-    # ordinary lighting/gray backgrounds can no longer masquerade as "smoke"
-    # and trigger alerts/toasts on their own.
 
     candidate_hazard = (
         yolo_result.get("detected", False)
@@ -2415,11 +2114,6 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
     st.session_state.alert_history.append(alert)
     st.session_state.latest_detection = alert
 
-    # Alerts (toast + siren) are gated on an ACTUAL YOLO detection.
-    # verdict["severity"] can still be elevated by the OpenCV color-heuristic
-    # fallback (kept for forensic logging), but that heuristic alone must
-    # never be enough to pop a hazard toast or ring the siren -- only a real
-    # YOLO fire/smoke box does.
     yolo_confirmed = yolo_result.get("detected", False)
     alert_severity = yolo_severity if yolo_confirmed else "NORMAL"
 
@@ -2444,12 +2138,6 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
 # SIDEBAR
 # =============================================================================
 def render_sidebar_profile() -> None:
-    """
-    Shows the signed-in Google account (avatar/name/email) plus a Log out
-    control. Backed by Streamlit's native st.user / st.logout(), which
-    authenticates directly against Google's OAuth endpoints — no separate
-    Cloud Function is needed for the sign-in flow itself.
-    """
     st.markdown("<div class='sidebar-footer-divider'></div>", unsafe_allow_html=True)
 
     user_name = getattr(st.user, "name", None) or "Signed in"
@@ -2480,7 +2168,6 @@ def render_sidebar_profile() -> None:
 
 
 def render_login_page() -> None:
-    """Google sign-in gate shown before the dashboard is reachable."""
     inject_custom_css()
 
     st.markdown("<div style='height: 12vh;'></div>", unsafe_allow_html=True)
@@ -2549,7 +2236,6 @@ def render_sidebar_nav() -> None:
         )
 
         st.markdown("<div class='sidebar-footer-divider'></div>", unsafe_allow_html=True)
-
         st.markdown("<div class='nav-section-label'>Workspace</div>", unsafe_allow_html=True)
 
         nav_items = [
@@ -2571,8 +2257,6 @@ def render_sidebar_nav() -> None:
                 st.session_state.active_page = label
                 st.rerun()
 
-        # Profile + Log out live in this keyed container; the CSS class
-        # ".st-key-sidebar_bottom_block" pins it to the bottom of the sidebar.
         with st.container(key="sidebar_bottom_block"):
             render_sidebar_profile()
 
@@ -2686,14 +2370,6 @@ def render_dashboard_header() -> None:
 def _render_live_stats_body() -> None:
     latest = st.session_state.get("latest_detection") or {}
 
-    # Mirror the SAME blended severity (YOLO + visual/YARA/VLM, whichever
-    # scores highest — see YARAVerifier.verify()'s final_severity) that
-    # Confidence below already reads and that actually drives the hazard
-    # toast/siren in run_detection_pipeline(). This used to read
-    # yolo_severity alone, so a hazard caught by YARA/VLM/visual analysis
-    # but missed by YOLO's own bounding-box detector (e.g. fire shown on a
-    # phone screen rather than real flame) would fire the "FIRE DETECTED"
-    # toast while this card still said NORMAL.
     severity = str(latest.get("severity", "NORMAL")).upper()
     if severity not in SEVERITY_STYLE:
         severity = "NORMAL"
@@ -2707,8 +2383,6 @@ def _render_live_stats_body() -> None:
 
         r1c1, r1c2 = st.columns(2)
         with r1c1:
-            # The key drives the colour via the .st-key-severity_metric_* CSS:
-            # NORMAL green, MEDIUM yellow, HIGH / CRITICAL red.
             with st.container(key=f"severity_metric_{severity.lower()}"):
                 st.metric("Severity", severity)
         r1c2.metric("Confidence", f"{confidence:.0f}%")
@@ -2719,9 +2393,6 @@ def _render_live_stats_body() -> None:
 
 
 def render_live_stats_panel() -> None:
-    # The camera loop runs inside its own 0.1s fragment, so a panel drawn only
-    # once per full script run would stay frozen. Give the panel its own
-    # fragment so the severity card updates while the camera is running.
     refresh = 0.5 if st.session_state.get("camera_running") else None
     st.fragment(_render_live_stats_body, run_every=refresh)()
 
@@ -2759,11 +2430,6 @@ def render_resource_trend_preview() -> None:
 # LIVE VIDEO STREAM (FULL-WIDTH 3x3 MATRIX)
 # =============================================================================
 def render_video_frame(video_placeholder, status_placeholder, alarm_placeholder) -> None:
-    # Evaluated every 0.1s fragment tick (see live_camera_fragment) so the
-    # hazard card fades in immediately and disappears on its own once
-    # CONFIG["TOAST_DISPLAY_SECONDS"] has elapsed — no early-return above
-    # this, so it still gets a last render even if Stop is pressed right
-    # after a hazard fires.
     render_custom_hazard_toast()
 
     if not st.session_state.get("camera_running", False):
@@ -2799,12 +2465,7 @@ def render_video_frame(video_placeholder, status_placeholder, alarm_placeholder)
 
     grid_matrix = construct_3x3_grid(active_frames)
 
-    # Alerts and the on-frame status are now gated on YOLO's own result --
-    # a YARA/VLM/visual-only signal that YOLO didn't confirm is logged for
-    # forensics but no longer surfaces as a hazard here (see
-    # run_detection_pipeline's yolo_confirmed gate).
     severity = st.session_state.get("yolo_severity", "NORMAL")
-
     yolo_result = pipeline_result.get("yolo", {})
     yolo_status = "DETECTED" if yolo_result.get("detected") else "CLEAR"
 
@@ -2834,7 +2495,8 @@ def render_video_frame(video_placeholder, status_placeholder, alarm_placeholder)
         status_placeholder.success("Live 3x3 multi-camera monitoring active...")
 
 
-@st.fragment(run_every=0.1)
+# Smooth refresh interval set to 0.5 seconds to prevent stalling
+@st.fragment(run_every=0.5)
 def live_camera_fragment(video_container, status_container, alarm_container):
     render_video_frame(video_container, status_container, alarm_container)
 
@@ -2873,8 +2535,6 @@ def render_video_feed() -> None:
             "Detection cannot start until that's fixed."
         )
 
-    # Mount the browser-camera transport at one stable tree position.
-    # The dashboard Start button is the only user-facing camera control.
     if st.session_state.get("use_webrtc"):
         render_browser_camera_widget(playing=st.session_state.camera_running)
 
@@ -2882,16 +2542,6 @@ def render_video_feed() -> None:
     status_placeholder = st.empty()
     alarm_placeholder = st.empty()
 
-    # Both placeholders must be WRITTEN TO at least once during this normal
-    # (non-fragment) run before live_camera_fragment below can claim a
-    # stable position in them for its own repeated writes — st.empty() only
-    # reserves a layout slot, it doesn't count as a write. Skipping this
-    # write whenever camera_running was already True (e.g. right after
-    # Start) is what raised StreamlitInvalidLayoutContextError: "container
-    # was not written to during the initial run". So render an initial
-    # frame/status unconditionally, for both the stopped and the
-    # just-started case, before deciding whether to hand the placeholders
-    # off to the fragment.
     if st.session_state.get("last_frame_rgb") is not None:
         render_frame(video_placeholder, st.session_state.last_frame_rgb)
     else:
