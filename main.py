@@ -305,8 +305,7 @@ def inject_custom_css() -> None:
             color: {text} !important;
         }}
 
-        /* PREVENT FRAGMENT DIMMING / FADING OUT ON UPDATE (stops the live
-           camera image from blinking/disappearing between fragment reruns) */
+        /* STABILIZE LIVE VIDEO CONTAINER TO PREVENT DISAPPEARING/BLINKING */
         div[data-testid="stFragment"],
         [data-testid="stFragment"] > div,
         div[data-testid="stElementContainer"],
@@ -1376,7 +1375,6 @@ class VideoCaptureManager:
         def _read_cam(item):
             idx, cap = item
             if cap and cap.isOpened():
-                # Grab latest frame and discard stale queue buffers
                 cap.grab()
                 ret, frame = cap.retrieve()
                 if ret and frame is not None:
@@ -2442,7 +2440,7 @@ def _render_live_stats_body() -> None:
 
 
 def render_live_stats_panel() -> None:
-    refresh = 0.08 if st.session_state.get("camera_running") else None
+    refresh = 0.1 if st.session_state.get("camera_running") else None
     st.fragment(_render_live_stats_body, run_every=refresh)()
 
 
@@ -2476,29 +2474,16 @@ def render_resource_trend_preview() -> None:
 
 
 # =============================================================================
-# LIVE VIDEO STREAM (PERSISTENT STABLE FRAGMENT)
+# LIVE VIDEO STREAM (STABLE FULL-WIDTH 3x3 MATRIX)
 # =============================================================================
-@st.fragment(run_every=0.08)
-def live_camera_fragment() -> None:
+@st.fragment(run_every=0.1)
+def live_camera_fragment(video_placeholder) -> None:
     render_custom_hazard_toast()
 
-    # Image container is created directly INSIDE fragment so Streamlit
-    # never unmounts or tears down the video feed element on update.
-    img_container = st.empty()
-
     if not st.session_state.get("camera_running", False):
-        if st.session_state.get("last_frame_rgb") is not None:
-            img_container.image(st.session_state.last_frame_rgb, use_container_width=True)
-        else:
-            img_container.image(
-                VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
-                use_container_width=True,
-            )
         return
 
     if st.session_state.get("_frame_processing_busy"):
-        if st.session_state.get("last_frame_rgb") is not None:
-            img_container.image(st.session_state.last_frame_rgb, use_container_width=True)
         return
 
     st.session_state._frame_processing_busy = True
@@ -2544,7 +2529,7 @@ def live_camera_fragment() -> None:
         grid_rgb = cv2.cvtColor(grid_matrix, cv2.COLOR_BGR2RGB)
         st.session_state.last_frame_rgb = grid_rgb
 
-        img_container.image(grid_rgb, channels="RGB", use_container_width=True)
+        video_placeholder.image(grid_rgb, channels="RGB", use_container_width=True)
     finally:
         st.session_state._frame_processing_busy = False
 
@@ -2588,7 +2573,20 @@ def render_video_feed() -> None:
     if st.session_state.get("use_webrtc"):
         render_browser_camera_widget(playing=st.session_state.camera_running)
 
-    live_camera_fragment()
+    video_placeholder = st.empty()
+
+    if not st.session_state.camera_running:
+        if st.session_state.get("last_frame_rgb") is not None:
+            video_placeholder.image(st.session_state.last_frame_rgb, use_container_width=True)
+        else:
+            video_placeholder.image(
+                VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
+                use_container_width=True,
+            )
+        st.info("Camera is stopped. Detection paused.")
+        return
+
+    live_camera_fragment(video_placeholder)
 
 
 def _build_forensic_display_df() -> Optional[pd.DataFrame]:
