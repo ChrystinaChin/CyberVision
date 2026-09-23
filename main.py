@@ -9,6 +9,7 @@ import sqlite3
 import threading
 import time
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
@@ -123,7 +124,7 @@ CONFIG: Dict[str, Any] = {
     "FRAME_WIDTH": 640,
     "FRAME_HEIGHT": 300,
     "JPEG_QUALITY": 70,
-    "FRAME_DELAY_SEC": 0.22,
+    "FRAME_DELAY_SEC": 0.0,
     "ANALYZE_EVERY_N_FRAMES": 12,
     "CPU_THRESHOLD": 95,
     "RAM_THRESHOLD": 90,
@@ -304,8 +305,6 @@ def inject_custom_css() -> None:
             color: {text} !important;
         }}
 
-        /* PREVENT FRAGMENT DIMMING / FADING OUT ON UPDATE (stops the live
-           camera image from blinking/disappearing between fragment reruns) */
         div[data-testid="stFragment"],
         [data-testid="stFragment"] > div,
         div[data-testid="stElementContainer"],
@@ -970,7 +969,7 @@ class SystemMonitor:
     @staticmethod
     def get_metrics() -> Dict[str, Any]:
         try:
-            cpu = float(psutil.cpu_percent(interval=0.03))
+            cpu = float(psutil.cpu_percent(interval=0.01))
             ram = float(psutil.virtual_memory().percent)
 
             metrics = {
@@ -1269,20 +1268,29 @@ def render_browser_camera_widget(playing: bool) -> None:
 
 
 # =============================================================================
-# MULTI-CAMERA HANDLING & 3x3 MATRIX
+# MULTI-CAMERA HANDLING & 3x3 MATRIX (OPTIMIZED NON-BLOCKING)
 # =============================================================================
 @st.cache_resource(show_spinner=False)
 def get_camera_caps() -> Dict[int, cv2.VideoCapture]:
     caps = {}
-    for idx, src in enumerate(CONFIG["CAMERA_SOURCES"]):
+
+    def _init_cam(args):
+        idx, src = args
         cap = cv2.VideoCapture(src)
         if cap.isOpened():
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            caps[idx] = cap
+            return idx, cap
         else:
             cap.release()
+            return idx, None
+
+    with ThreadPoolExecutor(max_workers=len(CONFIG["CAMERA_SOURCES"])) as executor:
+        results = executor.map(_init_cam, enumerate(CONFIG["CAMERA_SOURCES"]))
+        for idx, cap in results:
+            if cap is not None:
+                caps[idx] = cap
     return caps
 
 
@@ -1363,10 +1371,20 @@ class VideoCaptureManager:
             st.session_state.last_error = "No camera streams open."
             return {}, None
 
-        for idx, cap in list(caps.items()):
-            if cap.isOpened():
-                ret, frame = cap.read()
+        def _read_cam(item):
+            idx, cap = item
+            if cap and cap.isOpened():
+                # Grab latest frame and discard stale queue buffers
+                cap.grab()
+                ret, frame = cap.retrieve()
                 if ret and frame is not None:
+                    return idx, frame
+            return idx, None
+
+        with ThreadPoolExecutor(max_workers=max(1, len(caps))) as executor:
+            results = executor.map(_read_cam, caps.items())
+            for idx, frame in results:
+                if frame is not None:
                     active_frames[idx] = frame
                     if primary_frame is None:
                         primary_frame = cv2.resize(frame, (CONFIG["FRAME_WIDTH"], CONFIG["FRAME_HEIGHT"]))
@@ -1569,15 +1587,6 @@ class YOLOFireSmokeDetector:
             empty["error"] = f"YOLO detection issue: {exc}"
             return empty
 
-    # -------------------------------------------------------------------
-    # Async wrapper: YOLO inference on CPU can take longer than the
-    # 0.5s video-fragment tick. Running it synchronously inside the
-    # fragment is what caused the feed to freeze/flash every few
-    # seconds (see live_camera_fragment's busy-guard). Instead, hand the
-    # frame to a background thread the same way VLMInference already
-    # does, and let the fragment just poll a queue for the latest
-    # finished result on every tick.
-    # -------------------------------------------------------------------
     def _async_worker(self, frame: np.ndarray) -> None:
         result = self.detect(frame)
         YOLO_RESULT_QUEUE.put(result)
@@ -1609,11 +1618,6 @@ class YOLOFireSmokeDetector:
 
     @staticmethod
     def draw_boxes_on_frame(frame: np.ndarray, yolo_result: Dict[str, Any]) -> np.ndarray:
-        """Overlay the latest known detections onto the CURRENT live frame,
-        instead of swapping in the (possibly several-hundred-ms-old)
-        annotated_frame captured back when that detection last ran. This
-        keeps the video feed itself always live even while the boxes
-        lag one inference cycle behind."""
         if not yolo_result or not yolo_result.get("detections"):
             return frame
 
@@ -2094,12 +2098,6 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
         yolo_detector = YOLOFireSmokeDetector()
         st.session_state.yolo_detector = yolo_detector
 
-    # Pull in any detection that finished in the background since the last
-    # tick, then (re)dispatch a fresh one if it's time and nothing is
-    # already running. This keeps the fragment tick itself cheap and fast
-    # instead of blocking on the CPU-bound YOLO forward pass, which used
-    # to routinely overrun the 0.5s tick and cause the busy-guard to skip
-    # capture+render entirely (the freezing/flashing feed).
     yolo_detector.drain_worker_queue()
 
     frame_number = st.session_state.frames_processed
@@ -2116,13 +2114,11 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
         "classes": [], "annotated_frame": frame,
     }
 
-    # Primary YOLO severity drives system alert state
     yolo_severity = yolo_detector.hazard_severity(yolo_result) if yolo_result.get("detected") else "NORMAL"
     st.session_state.yolo_severity = yolo_severity
 
     visual_result = VisualFireSmokeDetector.detect(frame)
 
-    # VLM trigger ONLY fires when YOLO actually detects a hazard
     candidate_hazard = yolo_result.get("detected", False)
     analyze_this_frame = (
         candidate_hazard
@@ -2173,7 +2169,6 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
     st.session_state.alert_history.append(alert)
     st.session_state.latest_detection = alert
 
-    # Trigger alerts ONLY if YOLO identifies fire or smoke
     if yolo_severity != "NORMAL":
         hazard_title = determine_hazard_title(alert)
         dispatch_hazard_alerts(yolo_severity, hazard_title)
@@ -2445,7 +2440,7 @@ def _render_live_stats_body() -> None:
 
 
 def render_live_stats_panel() -> None:
-    refresh = 0.5 if st.session_state.get("camera_running") else None
+    refresh = 0.03 if st.session_state.get("camera_running") else None
     st.fragment(_render_live_stats_body, run_every=refresh)()
 
 
@@ -2479,22 +2474,15 @@ def render_resource_trend_preview() -> None:
 
 
 # =============================================================================
-# LIVE VIDEO STREAM (FULL-WIDTH 3x3 MATRIX)
+# LIVE VIDEO STREAM (FULL-WIDTH 3x3 MATRIX - REAL-TIME OPTIMIZED)
 # =============================================================================
-@st.fragment(run_every=0.5)
+@st.fragment(run_every=0.03)
 def live_camera_fragment(video_placeholder) -> None:
     render_custom_hazard_toast()
 
     if not st.session_state.get("camera_running", False):
         return
 
-    # Detection (YOLO/VLM/YARA) can take several seconds per frame. The
-    # fragment timer above still fires every 0.5s regardless, and if a new
-    # tick starts work while the previous one is still running, Streamlit
-    # tears down and rebuilds the fragment mid-flight — that's what made the
-    # feed flash on and off. This guard makes a busy tick a cheap no-op
-    # instead, so the last successfully drawn frame just stays on screen
-    # until the next one is ready.
     if st.session_state.get("_frame_processing_busy"):
         return
 
@@ -2516,14 +2504,6 @@ def live_camera_fragment(video_placeholder) -> None:
 
         pipeline_result = run_detection_pipeline(primary_frame)
 
-        # Always draw on top of THIS tick's live frame rather than
-        # swapping in the detector's cached annotated_frame (which could
-        # be a whole inference cycle old). The live feed now updates
-        # every tick regardless of whether a new detection has landed.
-        # Note: box coordinates were computed on primary_frame's
-        # resolution, so the overlay must be drawn on primary_frame
-        # (not the raw, differently-sized active_frames[0]) before it's
-        # handed to the grid, which resizes it to the tile size anyway.
         if 0 in active_frames and primary_frame is not None:
             yolo_for_overlay = pipeline_result.get("yolo", {})
             active_frames[0] = YOLOFireSmokeDetector.draw_boxes_on_frame(
@@ -2549,7 +2529,6 @@ def live_camera_fragment(video_placeholder) -> None:
         grid_rgb = cv2.cvtColor(grid_matrix, cv2.COLOR_BGR2RGB)
         st.session_state.last_frame_rgb = grid_rgb
 
-        # Smooth persistent container update avoids widget flickering/stutter
         video_placeholder.image(grid_rgb, channels="RGB", use_container_width=True)
     finally:
         st.session_state._frame_processing_busy = False
