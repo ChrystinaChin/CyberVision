@@ -154,6 +154,7 @@ SEVERITY_STYLE = {
 }
 
 VLM_RESULT_QUEUE: queue.Queue = queue.Queue()
+YOLO_RESULT_QUEUE: queue.Queue = queue.Queue()
 
 
 # =============================================================================
@@ -260,6 +261,7 @@ def init_session_state() -> None:
         "yolo_severity": "NORMAL",
         "yolo_detector": None,
         "yolo_detection": None,
+        "yolo_detection_in_progress": False,
         "last_vlm_candidate_frame": None,
         "latest_vlm_text": "",
         "alarm_active": False,
@@ -1564,8 +1566,65 @@ class YOLOFireSmokeDetector:
             }
 
         except Exception as exc:
-            st.session_state.last_error = f"YOLO detection issue: {exc}"
+            empty["error"] = f"YOLO detection issue: {exc}"
             return empty
+
+    # -------------------------------------------------------------------
+    # Async wrapper: YOLO inference on CPU can take longer than the
+    # 0.5s video-fragment tick. Running it synchronously inside the
+    # fragment is what caused the feed to freeze/flash every few
+    # seconds (see live_camera_fragment's busy-guard). Instead, hand the
+    # frame to a background thread the same way VLMInference already
+    # does, and let the fragment just poll a queue for the latest
+    # finished result on every tick.
+    # -------------------------------------------------------------------
+    def _async_worker(self, frame: np.ndarray) -> None:
+        result = self.detect(frame)
+        YOLO_RESULT_QUEUE.put(result)
+
+    def trigger_async_detect(self, frame: np.ndarray) -> None:
+        if st.session_state.get("yolo_detection_in_progress", False):
+            return
+        st.session_state.yolo_detection_in_progress = True
+        thread = threading.Thread(
+            target=self._async_worker,
+            args=(frame.copy(),),
+            daemon=True,
+        )
+        thread.start()
+
+    @staticmethod
+    def drain_worker_queue() -> None:
+        while not YOLO_RESULT_QUEUE.empty():
+            try:
+                result = YOLO_RESULT_QUEUE.get_nowait()
+            except queue.Empty:
+                break
+            st.session_state.yolo_detection_in_progress = False
+            st.session_state.yolo_detection = result
+            st.session_state.inference_count += 1
+            err = result.get("error")
+            if err:
+                st.session_state.last_error = err
+
+    @staticmethod
+    def draw_boxes_on_frame(frame: np.ndarray, yolo_result: Dict[str, Any]) -> np.ndarray:
+        """Overlay the latest known detections onto the CURRENT live frame,
+        instead of swapping in the (possibly several-hundred-ms-old)
+        annotated_frame captured back when that detection last ran. This
+        keeps the video feed itself always live even while the boxes
+        lag one inference cycle behind."""
+        if not yolo_result or not yolo_result.get("detections"):
+            return frame
+
+        annotated = frame.copy()
+        for det in yolo_result["detections"]:
+            x1, y1, x2, y2 = det["box"]
+            label = f"{det['class']} {det['confidence']:.0%}"
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            cv2.putText(annotated, label, (x1, max(y1 - 8, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        return annotated
 
     @staticmethod
     def hazard_severity(yolo_result: Dict[str, Any]) -> str:
@@ -2035,6 +2094,14 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
         yolo_detector = YOLOFireSmokeDetector()
         st.session_state.yolo_detector = yolo_detector
 
+    # Pull in any detection that finished in the background since the last
+    # tick, then (re)dispatch a fresh one if it's time and nothing is
+    # already running. This keeps the fragment tick itself cheap and fast
+    # instead of blocking on the CPU-bound YOLO forward pass, which used
+    # to routinely overrun the 0.5s tick and cause the busy-guard to skip
+    # capture+render entirely (the freezing/flashing feed).
+    yolo_detector.drain_worker_queue()
+
     frame_number = st.session_state.frames_processed
     run_yolo_now = (
         st.session_state.get("yolo_detection") is None
@@ -2042,13 +2109,12 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
     )
 
     if run_yolo_now:
-        yolo_result = yolo_detector.detect(frame)
-        st.session_state.yolo_detection = yolo_result
-    else:
-        yolo_result = st.session_state.get("yolo_detection") or {
-            "detected": False, "detections": [], "highest_confidence": 0.0,
-            "classes": [], "annotated_frame": frame,
-        }
+        yolo_detector.trigger_async_detect(frame)
+
+    yolo_result = st.session_state.get("yolo_detection") or {
+        "detected": False, "detections": [], "highest_confidence": 0.0,
+        "classes": [], "annotated_frame": frame,
+    }
 
     # Primary YOLO severity drives system alert state
     yolo_severity = yolo_detector.hazard_severity(yolo_result) if yolo_result.get("detected") else "NORMAL"
@@ -2450,8 +2516,19 @@ def live_camera_fragment(video_placeholder) -> None:
 
         pipeline_result = run_detection_pipeline(primary_frame)
 
-        if 0 in active_frames and pipeline_result.get("annotated_frame") is not None:
-            active_frames[0] = pipeline_result["annotated_frame"]
+        # Always draw on top of THIS tick's live frame rather than
+        # swapping in the detector's cached annotated_frame (which could
+        # be a whole inference cycle old). The live feed now updates
+        # every tick regardless of whether a new detection has landed.
+        # Note: box coordinates were computed on primary_frame's
+        # resolution, so the overlay must be drawn on primary_frame
+        # (not the raw, differently-sized active_frames[0]) before it's
+        # handed to the grid, which resizes it to the tile size anyway.
+        if 0 in active_frames and primary_frame is not None:
+            yolo_for_overlay = pipeline_result.get("yolo", {})
+            active_frames[0] = YOLOFireSmokeDetector.draw_boxes_on_frame(
+                primary_frame, yolo_for_overlay
+            )
 
         grid_matrix = construct_3x3_grid(active_frames)
 
