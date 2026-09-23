@@ -145,6 +145,7 @@ CONFIG: Dict[str, Any] = {
     "YOLO_CONFIDENCE": 0.45,
     "YOLO_IMAGE_SIZE": 160,       # Reduced from 320 to accelerate CPU inference
     "YOLO_EVERY_N_FRAMES": 6,     # Run real inference every 6th tick; reuse last result otherwise
+    "VISUAL_DETECT_EVERY_N_FRAMES": 3,  # HSV/YCrCb color analysis is CPU-heavy; don't run it every tick
 }
 
 SEVERITY_STYLE = {
@@ -1272,6 +1273,13 @@ def render_browser_camera_widget(playing: bool) -> None:
 # MULTI-CAMERA HANDLING & 3x3 MATRIX (OPTIMIZED NON-BLOCKING)
 # =============================================================================
 @st.cache_resource(show_spinner=False)
+def _get_camera_read_executor(n_workers: int) -> ThreadPoolExecutor:
+    # One long-lived pool, reused across every fragment tick instead of
+    # being created and torn down every 100ms.
+    return ThreadPoolExecutor(max_workers=max(1, n_workers))
+
+
+@st.cache_resource(show_spinner=False)
 def get_camera_caps() -> Dict[int, cv2.VideoCapture]:
     caps = {}
 
@@ -1320,6 +1328,20 @@ def create_blank_tile(width: int = 320, height: int = 240, label: str = "NO CAME
     return frame
 
 
+_BLANK_TILE_CACHE: Dict[Tuple[int, int, str], np.ndarray] = {}
+
+
+def get_cached_blank_tile(width: int, height: int, label: str) -> np.ndarray:
+    # The "NO CAMERA" tile is identical every tick — draw it once and reuse
+    # the array instead of re-running cv2.putText/rectangle 10x/second.
+    key = (width, height, label)
+    tile = _BLANK_TILE_CACHE.get(key)
+    if tile is None:
+        tile = create_blank_tile(width, height, label)
+        _BLANK_TILE_CACHE[key] = tile
+    return tile.copy()
+
+
 def construct_3x3_grid(active_frames: Dict[int, np.ndarray], tile_w: int = 320, tile_h: int = 240) -> np.ndarray:
     tiles = []
     for idx in range(9):
@@ -1330,7 +1352,7 @@ def construct_3x3_grid(active_frames: Dict[int, np.ndarray], tile_w: int = 320, 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
             cv2.rectangle(tile, (0, 0), (tile_w - 1, tile_h - 1), (0, 255, 0), 1)
         else:
-            tile = create_blank_tile(tile_w, tile_h, label=f"{cam_key}: NO CAMERA DETECTED")
+            tile = get_cached_blank_tile(tile_w, tile_h, f"{cam_key}: NO CAMERA DETECTED")
         tiles.append(tile)
 
     row1 = np.hstack([tiles[0], tiles[1], tiles[2]])
@@ -1338,6 +1360,7 @@ def construct_3x3_grid(active_frames: Dict[int, np.ndarray], tile_w: int = 320, 
     row3 = np.hstack([tiles[6], tiles[7], tiles[8]])
 
     return np.vstack([row1, row2, row3])
+
 
 
 class VideoCaptureManager:
@@ -1381,13 +1404,18 @@ class VideoCaptureManager:
                     return idx, frame
             return idx, None
 
-        with ThreadPoolExecutor(max_workers=max(1, len(caps))) as executor:
-            results = executor.map(_read_cam, caps.items())
-            for idx, frame in results:
-                if frame is not None:
-                    active_frames[idx] = frame
-                    if primary_frame is None:
-                        primary_frame = cv2.resize(frame, (CONFIG["FRAME_WIDTH"], CONFIG["FRAME_HEIGHT"]))
+        # Single camera: skip threading entirely, it's pure overhead.
+        if len(caps) == 1:
+            results = [_read_cam(item) for item in caps.items()]
+        else:
+            executor = _get_camera_read_executor(len(caps))
+            results = list(executor.map(_read_cam, caps.items()))
+
+        for idx, frame in results:
+            if frame is not None:
+                active_frames[idx] = frame
+                if primary_frame is None:
+                    primary_frame = cv2.resize(frame, (CONFIG["FRAME_WIDTH"], CONFIG["FRAME_HEIGHT"]))
 
         return active_frames, primary_frame
 
@@ -2117,7 +2145,15 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
     yolo_severity = yolo_detector.hazard_severity(yolo_result) if yolo_result.get("detected") else "NORMAL"
     st.session_state.yolo_severity = yolo_severity
 
-    visual_result = VisualFireSmokeDetector.detect(frame)
+    run_visual_now = (
+        st.session_state.get("last_visual_result") is None
+        or frame_number % max(1, CONFIG["VISUAL_DETECT_EVERY_N_FRAMES"]) == 0
+    )
+    if run_visual_now:
+        visual_result = VisualFireSmokeDetector.detect(frame)
+        st.session_state.last_visual_result = visual_result
+    else:
+        visual_result = st.session_state.last_visual_result
 
     candidate_hazard = yolo_result.get("detected", False)
     analyze_this_frame = (
@@ -2529,7 +2565,11 @@ def live_camera_fragment(video_placeholder) -> None:
         grid_rgb = cv2.cvtColor(grid_matrix, cv2.COLOR_BGR2RGB)
         st.session_state.last_frame_rgb = grid_rgb
 
-        video_placeholder.image(grid_rgb, channels="RGB", use_container_width=True)
+        # JPEG encodes far faster and more consistently than the default PNG,
+        # which was the main source of frame-to-frame timing jitter (glitch).
+        video_placeholder.image(
+            grid_rgb, channels="RGB", use_container_width=True, output_format="JPEG"
+        )
     finally:
         st.session_state._frame_processing_busy = False
 
