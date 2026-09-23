@@ -1351,7 +1351,21 @@ def get_ice_servers() -> list:
     network round-trip per session for the ttl_seconds below.
     """
     cache_key = "_ice_servers_cache"
+    diag_key = "_ice_server_diagnostics_cache"
     ttl_seconds = 3000
+
+    # ICE_SERVER_DIAGNOSTICS is a module-level dict, but Streamlit re-runs
+    # this entire script top-to-bottom on every interaction, which re-runs
+    # the `ICE_SERVER_DIAGNOSTICS: Dict[str, str] = {...}` assignment at
+    # module scope too and wipes out whatever the last real check found.
+    # Combined with the st.session_state cache below (which DOES survive
+    # reruns), that made the "Last-fetch detail" caption go blank on every
+    # rerun after the one that actually performed the fetch — hiding the
+    # real reason for any STUN fallback. Restore it from session_state,
+    # which is rerun-safe, before doing anything else.
+    if diag_key in st.session_state:
+        ICE_SERVER_DIAGNOSTICS.update(st.session_state[diag_key])
+
     cached = st.session_state.get(cache_key)
     if cached and (time.time() - cached["fetched_at"]) < ttl_seconds:
         return cached["servers"]
@@ -1380,6 +1394,7 @@ def get_ice_servers() -> list:
         ice_servers = STUN_ONLY_ICE_SERVERS
 
     st.session_state[cache_key] = {"servers": ice_servers, "fetched_at": time.time()}
+    st.session_state[diag_key] = dict(ICE_SERVER_DIAGNOSTICS)
     return ice_servers
 
 
