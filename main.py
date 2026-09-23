@@ -1225,7 +1225,7 @@ def _describe_ice_servers(ice_servers: list) -> str:
             has_turn_credential = True
 
 
-def render_browser_camera_widget(playing: bool) -> None:
+def render_browser_camera_widget(playing: bool) -> str:
     if not WEBRTC_AVAILABLE:
         if playing:
             st.error(
