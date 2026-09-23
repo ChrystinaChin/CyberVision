@@ -1328,20 +1328,6 @@ def create_blank_tile(width: int = 320, height: int = 240, label: str = "NO CAME
     return frame
 
 
-_BLANK_TILE_CACHE: Dict[Tuple[int, int, str], np.ndarray] = {}
-
-
-def get_cached_blank_tile(width: int, height: int, label: str) -> np.ndarray:
-    # The "NO CAMERA" tile is identical every tick — draw it once and reuse
-    # the array instead of re-running cv2.putText/rectangle 10x/second.
-    key = (width, height, label)
-    tile = _BLANK_TILE_CACHE.get(key)
-    if tile is None:
-        tile = create_blank_tile(width, height, label)
-        _BLANK_TILE_CACHE[key] = tile
-    return tile.copy()
-
-
 def construct_3x3_grid(active_frames: Dict[int, np.ndarray], tile_w: int = 320, tile_h: int = 240) -> np.ndarray:
     tiles = []
     for idx in range(9):
@@ -1352,7 +1338,7 @@ def construct_3x3_grid(active_frames: Dict[int, np.ndarray], tile_w: int = 320, 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
             cv2.rectangle(tile, (0, 0), (tile_w - 1, tile_h - 1), (0, 255, 0), 1)
         else:
-            tile = get_cached_blank_tile(tile_w, tile_h, f"{cam_key}: NO CAMERA DETECTED")
+            tile = create_blank_tile(tile_w, tile_h, label=f"{cam_key}: NO CAMERA DETECTED")
         tiles.append(tile)
 
     row1 = np.hstack([tiles[0], tiles[1], tiles[2]])
@@ -1360,7 +1346,6 @@ def construct_3x3_grid(active_frames: Dict[int, np.ndarray], tile_w: int = 320, 
     row3 = np.hstack([tiles[6], tiles[7], tiles[8]])
 
     return np.vstack([row1, row2, row3])
-
 
 
 class VideoCaptureManager:
@@ -2565,11 +2550,7 @@ def live_camera_fragment(video_placeholder) -> None:
         grid_rgb = cv2.cvtColor(grid_matrix, cv2.COLOR_BGR2RGB)
         st.session_state.last_frame_rgb = grid_rgb
 
-        # JPEG encodes far faster and more consistently than the default PNG,
-        # which was the main source of frame-to-frame timing jitter (glitch).
-        video_placeholder.image(
-            grid_rgb, channels="RGB", use_container_width=True, output_format="JPEG"
-        )
+        video_placeholder.image(grid_rgb, channels="RGB", use_container_width=True)
     finally:
         st.session_state._frame_processing_busy = False
 
