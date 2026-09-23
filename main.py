@@ -803,23 +803,6 @@ def inject_custom_css() -> None:
         .video-status-bar b {{
             color: {accent_dark};
         }}
-
-        .st-key-webrtc_transport {{
-            height: 0 !important;
-            min-height: 0 !important;
-            max-height: 0 !important;
-            overflow: hidden !important;
-            margin: 0 !important;
-            padding: 0 !important;
-            border: 0 !important;
-        }}
-        .st-key-webrtc_transport iframe {{
-            height: 1px !important;
-            min-height: 1px !important;
-            max-height: 1px !important;
-            opacity: 0 !important;
-            pointer-events: none !important;
-        }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -1228,20 +1211,15 @@ def render_browser_camera_widget(playing: bool) -> None:
             )
         return
 
-    with st.container(key="webrtc_transport"):
-        ctx = webrtc_streamer(
-            key="cybervision-browser-camera",
-            mode=WebRtcMode.SENDONLY,
-            desired_playing_state=playing,
-            rtc_configuration=RTCConfiguration({"iceServers": get_ice_servers()}),
-            media_stream_constraints={"video": True, "audio": False},
-            video_processor_factory=BrowserCameraProcessor,
-            video_html_attrs=VideoHTMLAttributes(
-                autoPlay=True, controls=False, muted=True, style={"display": "none"}
-            ),
-            media_toggle_controls=False,
-            async_processing=True,
-        )
+    ctx = webrtc_streamer(
+        key="cybervision-browser-camera",
+        mode=WebRtcMode.SENDONLY,
+        desired_playing_state=playing,
+        rtc_configuration=RTCConfiguration({"iceServers": get_ice_servers()}),
+        media_stream_constraints={"video": True, "audio": False},
+        video_processor_factory=BrowserCameraProcessor,
+        async_processing=True,
+    )
     st.session_state.webrtc_ctx = ctx
 
 
@@ -1328,9 +1306,6 @@ class VideoCaptureManager:
             return {}, None
 
         primary_frame = cv2.resize(frame, (CONFIG["FRAME_WIDTH"], CONFIG["FRAME_HEIGHT"]))
-        
-        # Mirror/replicate single WebRTC camera stream across all 9 tiles on cloud
-        # to ensure the 3x3 layout works without flickering or missing tiles.
         grid_frames = {i: frame.copy() for i in range(9)}
         return grid_frames, primary_frame
 
@@ -2415,7 +2390,13 @@ def render_video_frame(video_placeholder, status_placeholder) -> None:
         active_frames, primary_frame = VideoCaptureManager.capture_active_frames()
 
         if primary_frame is None and not active_frames:
-            status_placeholder.error(st.session_state.get("last_error") or "Camera unavailable.")
+            # Display real-time capture failure reason if camera streams aren't providing frames
+            placeholder_img = VideoCaptureManager.placeholder_frame(
+                "Awaiting Camera Frame", 
+                st.session_state.get("last_error", "Initializing camera stream...")
+            )
+            video_placeholder.image(placeholder_img, use_container_width=True)
+            status_placeholder.error(st.session_state.get("last_error") or "Camera stream unavailable.")
             return
 
         current_time = time.time()
