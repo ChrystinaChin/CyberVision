@@ -303,9 +303,11 @@ def inject_custom_css() -> None:
 
         /* PREVENT FRAGMENT DIMMING / FADING OUT ON UPDATE */
         div[data-testid="stFragment"],
-        [data-testid="stFragment"] > div {{
+        [data-testid="stFragment"] > div,
+        div[data-testid="stElementContainer"],
+        [data-stale="true"] {{
             opacity: 1 !important;
-            transition: opacity 0s !important;
+            transition: none !important;
             filter: none !important;
         }}
 
@@ -876,24 +878,22 @@ def build_siren_wav_base64(
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
-def update_critical_alarm(placeholder, is_critical: bool) -> None:
-    should_ring = bool(is_critical) and st.session_state.sound_enabled
-    was_ringing = st.session_state.get("alarm_active", False)
+def play_critical_alarm(is_critical: bool) -> None:
+    """Plays continuous siren sound while severity remains CRITICAL."""
+    st.session_state.alarm_active = bool(is_critical) and st.session_state.sound_enabled
 
-    if should_ring and not was_ringing:
-        siren_b64 = build_siren_wav_base64()
-        placeholder.markdown(
-            f"""
-            <audio autoplay loop style="display:none;">
-                <source src="data:audio/wav;base64,{siren_b64}" type="audio/wav">
-            </audio>
-            """,
-            unsafe_allow_html=True,
-        )
-    elif not should_ring and was_ringing:
-        placeholder.empty()
+    if not st.session_state.alarm_active:
+        return
 
-    st.session_state.alarm_active = should_ring
+    siren_b64 = build_siren_wav_base64()
+    st.markdown(
+        f"""
+        <audio autoplay loop style="display:none;">
+            <source src="data:audio/wav;base64,{siren_b64}" type="audio/wav">
+        </audio>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def dispatch_hazard_alerts(severity_str: str, hazard_title: str) -> None:
@@ -1307,21 +1307,6 @@ def create_blank_tile(width: int = 320, height: int = 240, label: str = "NO CAME
     cv2.putText(frame, label, (text_x, text_y), font, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
     cv2.rectangle(frame, (0, 0), (width - 1, height - 1), (40, 40, 40), 1)
     return frame
-
-
-def render_frame(placeholder, rgb_array: Optional[np.ndarray]) -> None:
-    if rgb_array is None:
-        return
-    bgr = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2BGR)
-    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
-    if not ok:
-        placeholder.error("Failed to encode video frame.")
-        return
-    data_uri = "data:image/jpeg;base64," + base64.b64encode(buf).decode("ascii")
-    placeholder.markdown(
-        f'<img src="{data_uri}" style="width:100%;display:block;border-radius:12px;" />',
-        unsafe_allow_html=True,
-    )
 
 
 def construct_3x3_grid(active_frames: Dict[int, np.ndarray], tile_w: int = 320, tile_h: int = 240) -> np.ndarray:
@@ -2033,12 +2018,12 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
             "smoke_ratio": 0.0,
             "yara_available": YARA_AVAILABLE,
         }
+        play_critical_alarm(False)
         st.session_state.yolo_severity = "NORMAL"
         return {
             "annotated_frame": frame,
             "yolo": {"detected": False, "detections": []},
             "alert": default_alert,
-            "is_critical": False,
         }
 
     ResourceGovernor.check_resource_pressure()
@@ -2069,7 +2054,14 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
         }
 
     yolo_severity = yolo_detector.hazard_severity(yolo_result)
+    # Exposed to UI so Active Monitoring severity mirrors live YOLO result directly
     st.session_state.yolo_severity = yolo_severity
+
+    if SEVERITY_STYLE[yolo_severity]["score"] > SEVERITY_STYLE[visual_result["visual_severity"]]["score"]:
+        visual_result["visual_severity"] = yolo_severity
+        if yolo_result.get("detections"):
+            first = yolo_result["detections"][0]
+            visual_result["visual_keyword"] = f"yolo_{first['class']}_{first['confidence']:.2f}"
 
     candidate_hazard = (
         yolo_result.get("detected", False)
@@ -2114,14 +2106,14 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
     st.session_state.alert_history.append(alert)
     st.session_state.latest_detection = alert
 
-    yolo_confirmed = yolo_result.get("detected", False)
-    alert_severity = yolo_severity if yolo_confirmed else "NORMAL"
+    # Trigger audio & hazard-card notifications on threat detection
+    hazard_title = determine_hazard_title(alert)
+    effective_severity = yolo_severity if yolo_severity != "NORMAL" else alert.get("severity", "NORMAL")
 
-    if yolo_confirmed:
-        hazard_title = determine_hazard_title(alert)
-        dispatch_hazard_alerts(alert_severity, hazard_title)
+    if effective_severity != "NORMAL":
+        dispatch_hazard_alerts(effective_severity, hazard_title)
 
-    is_critical_now = yolo_confirmed and alert_severity == "CRITICAL"
+    play_critical_alarm(effective_severity == "CRITICAL")
 
     if verdict["is_hazard"]:
         upload_to_google_cloud_async(frame, alert)
@@ -2130,7 +2122,6 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
         "annotated_frame": yolo_result.get("annotated_frame", frame),
         "yolo": yolo_result,
         "alert": alert,
-        "is_critical": is_critical_now,
     }
 
 
@@ -2370,7 +2361,8 @@ def render_dashboard_header() -> None:
 def _render_live_stats_body() -> None:
     latest = st.session_state.get("latest_detection") or {}
 
-    severity = str(latest.get("severity", "NORMAL")).upper()
+    # Severity mirrors YOLO severity directly, matching Cam1 status
+    severity = str(st.session_state.get("yolo_severity", "NORMAL")).upper()
     if severity not in SEVERITY_STYLE:
         severity = "NORMAL"
 
@@ -2429,16 +2421,16 @@ def render_resource_trend_preview() -> None:
 # =============================================================================
 # LIVE VIDEO STREAM (FULL-WIDTH 3x3 MATRIX)
 # =============================================================================
-def render_video_frame(video_placeholder, status_placeholder, alarm_placeholder) -> None:
+def render_video_frame(video_placeholder, status_placeholder) -> None:
     render_custom_hazard_toast()
 
     if not st.session_state.get("camera_running", False):
         if st.session_state.get("last_frame_rgb") is not None:
-            render_frame(video_placeholder, st.session_state.last_frame_rgb)
+            video_placeholder.image(st.session_state.last_frame_rgb, use_container_width=True)
         else:
-            render_frame(
-                video_placeholder,
+            video_placeholder.image(
                 VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
+                use_container_width=True,
             )
         status_placeholder.info("Camera is stopped. Detection paused.")
         return
@@ -2458,7 +2450,6 @@ def render_video_frame(video_placeholder, status_placeholder, alarm_placeholder)
     st.session_state.frames_processed += 1
 
     pipeline_result = run_detection_pipeline(primary_frame)
-    update_critical_alarm(alarm_placeholder, pipeline_result.get("is_critical", False))
 
     if 0 in active_frames and pipeline_result.get("annotated_frame") is not None:
         active_frames[0] = pipeline_result["annotated_frame"]
@@ -2482,7 +2473,8 @@ def render_video_frame(video_placeholder, status_placeholder, alarm_placeholder)
     grid_rgb = cv2.cvtColor(grid_matrix, cv2.COLOR_BGR2RGB)
     st.session_state.last_frame_rgb = grid_rgb
 
-    render_frame(video_placeholder, grid_rgb)
+    # Smooth native Streamlit image rendering (prevents base64 flickering)
+    video_placeholder.image(grid_rgb, channels="RGB", use_container_width=True)
 
     if not YOLO_AVAILABLE:
         status_placeholder.warning("Ultralytics is not installed.")
@@ -2495,10 +2487,9 @@ def render_video_frame(video_placeholder, status_placeholder, alarm_placeholder)
         status_placeholder.success("Live 3x3 multi-camera monitoring active...")
 
 
-# Smooth refresh interval set to 0.5 seconds to prevent stalling
-@st.fragment(run_every=0.5)
-def live_camera_fragment(video_container, status_container, alarm_container):
-    render_video_frame(video_container, status_container, alarm_container)
+@st.fragment(run_every=0.1)
+def live_camera_fragment(video_container, status_container):
+    render_video_frame(video_container, status_container)
 
 
 def render_video_feed() -> None:
@@ -2540,27 +2531,19 @@ def render_video_feed() -> None:
 
     video_placeholder = st.empty()
     status_placeholder = st.empty()
-    alarm_placeholder = st.empty()
-
-    if st.session_state.get("last_frame_rgb") is not None:
-        render_frame(video_placeholder, st.session_state.last_frame_rgb)
-    else:
-        render_frame(
-            video_placeholder,
-            VideoCaptureManager.placeholder_frame(
-                "Starting camera..." if st.session_state.camera_running else "Camera Stopped",
-                "Connecting to feed..." if st.session_state.camera_running else "Click Start to begin monitoring.",
-            ),
-        )
-    status_placeholder.info(
-        "Starting camera..." if st.session_state.camera_running else "Camera is stopped. Detection paused."
-    )
-    alarm_placeholder.markdown("<!-- alarm -->", unsafe_allow_html=True)
 
     if not st.session_state.camera_running:
+        if st.session_state.get("last_frame_rgb") is not None:
+            video_placeholder.image(st.session_state.last_frame_rgb, use_container_width=True)
+        else:
+            video_placeholder.image(
+                VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
+                use_container_width=True,
+            )
+        status_placeholder.info("Camera is stopped. Detection paused.")
         return
 
-    live_camera_fragment(video_placeholder, status_placeholder, alarm_placeholder)
+    live_camera_fragment(video_placeholder, status_placeholder)
 
 
 def _build_forensic_display_df() -> Optional[pd.DataFrame]:
