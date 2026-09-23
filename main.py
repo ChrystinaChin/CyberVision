@@ -1317,7 +1317,6 @@ def _fetch_metered_ice_servers(api_key: str, domain: str) -> Optional[list]:
         return None
 
 
-@st.cache_data(ttl=3000, show_spinner=False)
 def get_ice_servers() -> list:
     """Three-tier ICE server strategy, cheapest/simplest first:
 
@@ -1336,28 +1335,52 @@ def get_ice_servers() -> list:
     Whichever TURN tier is configured takes priority over plain STUN, since
     STUN alone is the one most likely to leave the stream stuck at
     "Waiting for first frame" on a hosted platform.
+
+    Cached in st.session_state (NOT @st.cache_data): a process-wide cache
+    here means every visitor, and every reconnect from the SAME visitor
+    (e.g. a plain browser refresh, which always tears down and rebuilds
+    the browser-side RTCPeerConnection from scratch) would be handed the
+    exact same TURN username/credential pair for as long as the cache TTL
+    lasts. Two independent WebRTC sessions racing to open allocations on
+    one shared credential is a plausible way for a connection that worked
+    a minute ago to fail right after a refresh, and it's indistinguishable
+    from the browser side from any other ICE failure — it just looks like
+    "stuck at Waiting for first frame" again. Keying the cache off
+    st.session_state instead gives every new session (hence every refresh)
+    its own freshly-minted credential, while still only paying for one
+    network round-trip per session for the ttl_seconds below.
     """
+    cache_key = "_ice_servers_cache"
+    ttl_seconds = 3000
+    cached = st.session_state.get(cache_key)
+    if cached and (time.time() - cached["fetched_at"]) < ttl_seconds:
+        return cached["servers"]
+
     cf_key_id, cf_api_token = _get_cloudflare_turn_credentials()
+    ice_servers = None
     if cf_key_id and cf_api_token:
         ice_servers = _fetch_cloudflare_ice_servers(cf_key_id, cf_api_token)
         if ice_servers:
             ICE_SERVER_DIAGNOSTICS.update(tier="cloudflare", detail="TURN credentials minted OK.")
-            return ice_servers
     else:
         ICE_SERVER_DIAGNOSTICS["detail"] = (
             "CLOUDFLARE_TURN_KEY_ID / CLOUDFLARE_TURN_KEY_API_TOKEN not set "
             "(checked env vars and st.secrets)."
         )
 
-    metered_key, metered_domain = _get_metered_credentials()
-    if metered_key and metered_domain:
-        ice_servers = _fetch_metered_ice_servers(metered_key, metered_domain)
-        if ice_servers:
-            ICE_SERVER_DIAGNOSTICS.update(tier="metered", detail="TURN credentials fetched OK.")
-            return ice_servers
+    if not ice_servers:
+        metered_key, metered_domain = _get_metered_credentials()
+        if metered_key and metered_domain:
+            ice_servers = _fetch_metered_ice_servers(metered_key, metered_domain)
+            if ice_servers:
+                ICE_SERVER_DIAGNOSTICS.update(tier="metered", detail="TURN credentials fetched OK.")
 
-    ICE_SERVER_DIAGNOSTICS["tier"] = "stun-only"
-    return STUN_ONLY_ICE_SERVERS
+    if not ice_servers:
+        ICE_SERVER_DIAGNOSTICS["tier"] = "stun-only"
+        ice_servers = STUN_ONLY_ICE_SERVERS
+
+    st.session_state[cache_key] = {"servers": ice_servers, "fetched_at": time.time()}
+    return ice_servers
 
 
 def render_browser_camera_widget(playing: bool) -> None:
