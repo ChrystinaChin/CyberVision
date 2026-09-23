@@ -1224,8 +1224,14 @@ def _describe_ice_servers(ice_servers: list) -> str:
         if server.get("credential"):
             has_turn_credential = True
 
+    if any("cloudflare.com" in u for u in urls) and has_turn_credential:
+        return ":material/check_circle: Browser camera relay: Cloudflare TURN configured."
+    if has_turn_credential:
+        return ":material/check_circle: Browser camera relay: TURN relay configured."
+    return ":material/info: Browser camera relay: STUN configured."
 
-def render_browser_camera_widget(playing: bool) -> str:
+
+def render_browser_camera_widget(playing: bool) -> None:
     if not WEBRTC_AVAILABLE:
         if playing:
             st.error(
@@ -1350,8 +1356,6 @@ class VideoCaptureManager:
 
         for idx, cap in list(caps.items()):
             if cap.isOpened():
-                for _ in range(2):
-                    cap.grab()
                 ret, frame = cap.read()
                 if ret and frame is not None:
                     active_frames[idx] = frame
@@ -2272,7 +2276,9 @@ def render_dashboard_settings_panel() -> None:
 
         if st.session_state.get("use_webrtc"):
             ice_servers = get_ice_servers()
-            st.caption(_describe_ice_servers(ice_servers))
+            desc = _describe_ice_servers(ice_servers)
+            if desc:
+                st.caption(desc)
 
         timeout_option = st.selectbox(
             "Inference timeout target",
@@ -2409,7 +2415,7 @@ def render_resource_trend_preview() -> None:
 # LIVE VIDEO STREAM (FULL-WIDTH 3x3 MATRIX)
 # =============================================================================
 @st.fragment(run_every=0.1)
-def live_camera_fragment() -> None:
+def live_camera_fragment(video_placeholder) -> None:
     render_custom_hazard_toast()
 
     if not st.session_state.get("camera_running", False):
@@ -2453,18 +2459,8 @@ def live_camera_fragment() -> None:
     grid_rgb = cv2.cvtColor(grid_matrix, cv2.COLOR_BGR2RGB)
     st.session_state.last_frame_rgb = grid_rgb
 
-    # Native Streamlit image call inside fragment avoids element flickering
-    st.image(grid_rgb, channels="RGB", use_container_width=True)
-
-    if not YOLO_AVAILABLE:
-        st.warning("Ultralytics is not installed.")
-    elif not is_yolo_model_available():
-        st.warning("YOLO model not found.")
-    elif yolo_result.get("detected"):
-        detections = ", ".join(f"{d['class']} ({d['confidence']:.0%})" for d in yolo_result.get("detections", []))
-        st.warning(f"YOLO detection: {detections}")
-    else:
-        st.success("Live 3x3 multi-camera monitoring active...")
+    # Smooth persistent container update avoids widget flickering/stutter
+    video_placeholder.image(grid_rgb, channels="RGB", use_container_width=True)
 
 
 def render_video_feed() -> None:
@@ -2506,18 +2502,20 @@ def render_video_feed() -> None:
     if st.session_state.get("use_webrtc"):
         render_browser_camera_widget(playing=st.session_state.camera_running)
 
+    video_placeholder = st.empty()
+
     if not st.session_state.camera_running:
         if st.session_state.get("last_frame_rgb") is not None:
-            st.image(st.session_state.last_frame_rgb, use_container_width=True)
+            video_placeholder.image(st.session_state.last_frame_rgb, use_container_width=True)
         else:
-            st.image(
+            video_placeholder.image(
                 VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
                 use_container_width=True,
             )
         st.info("Camera is stopped. Detection paused.")
         return
 
-    live_camera_fragment()
+    live_camera_fragment(video_placeholder)
 
 
 def _build_forensic_display_df() -> Optional[pd.DataFrame]:
