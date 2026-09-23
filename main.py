@@ -2474,28 +2474,16 @@ def render_resource_trend_preview() -> None:
 
 
 # =============================================================================
-# LIVE VIDEO STREAM (STABLE FRAGMENT SCOPE)
+# LIVE VIDEO STREAM (STABLE FULL-WIDTH 3x3 MATRIX)
 # =============================================================================
 @st.fragment(run_every=0.1)
-def live_camera_fragment() -> None:
+def live_camera_fragment(video_placeholder) -> None:
     render_custom_hazard_toast()
 
-    # Container belongs strictly to fragment execution context
-    video_container = st.empty()
-
     if not st.session_state.get("camera_running", False):
-        if st.session_state.get("last_frame_rgb") is not None:
-            video_container.image(st.session_state.last_frame_rgb, use_container_width=True)
-        else:
-            video_container.image(
-                VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
-                use_container_width=True,
-            )
         return
 
     if st.session_state.get("_frame_processing_busy"):
-        if st.session_state.get("last_frame_rgb") is not None:
-            video_container.image(st.session_state.last_frame_rgb, use_container_width=True)
         return
 
     st.session_state._frame_processing_busy = True
@@ -2541,7 +2529,7 @@ def live_camera_fragment() -> None:
         grid_rgb = cv2.cvtColor(grid_matrix, cv2.COLOR_BGR2RGB)
         st.session_state.last_frame_rgb = grid_rgb
 
-        video_container.image(grid_rgb, channels="RGB", use_container_width=True)
+        video_placeholder.image(grid_rgb, channels="RGB", use_container_width=True)
     finally:
         st.session_state._frame_processing_busy = False
 
@@ -2585,8 +2573,20 @@ def render_video_feed() -> None:
     if st.session_state.get("use_webrtc"):
         render_browser_camera_widget(playing=st.session_state.camera_running)
 
-    # Render fragment scope directly
-    live_camera_fragment()
+    video_placeholder = st.empty()
+
+    if not st.session_state.camera_running:
+        if st.session_state.get("last_frame_rgb") is not None:
+            video_placeholder.image(st.session_state.last_frame_rgb, use_container_width=True)
+        else:
+            video_placeholder.image(
+                VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
+                use_container_width=True,
+            )
+        st.info("Camera is stopped. Detection paused.")
+        return
+
+    live_camera_fragment(video_placeholder)
 
 
 def _build_forensic_display_df() -> Optional[pd.DataFrame]:
