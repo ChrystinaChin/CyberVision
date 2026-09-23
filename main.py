@@ -302,6 +302,8 @@ def inject_custom_css() -> None:
             color: {text} !important;
         }}
 
+        /* PREVENT FRAGMENT DIMMING / FADING OUT ON UPDATE (stops the live
+           camera image from blinking/disappearing between fragment reruns) */
         div[data-testid="stFragment"],
         [data-testid="stFragment"] > div,
         div[data-testid="stElementContainer"],
@@ -803,6 +805,23 @@ def inject_custom_css() -> None:
         .video-status-bar b {{
             color: {accent_dark};
         }}
+
+        .st-key-webrtc_transport {{
+            height: 0 !important;
+            min-height: 0 !important;
+            max-height: 0 !important;
+            overflow: hidden !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            border: 0 !important;
+        }}
+        .st-key-webrtc_transport iframe {{
+            height: 1px !important;
+            min-height: 1px !important;
+            max-height: 1px !important;
+            opacity: 0 !important;
+            pointer-events: none !important;
+        }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -1201,25 +1220,49 @@ def get_ice_servers() -> list:
     return ice_servers
 
 
+def _describe_ice_servers(ice_servers: list) -> str:
+    urls: list = []
+    has_turn_credential = False
+    for server in ice_servers:
+        server_urls = server.get("urls", [])
+        if isinstance(server_urls, str):
+            server_urls = [server_urls]
+        urls.extend(server_urls)
+        if server.get("credential"):
+            has_turn_credential = True
+
+    if any("cloudflare.com" in u for u in urls) and has_turn_credential:
+        return ":material/check_circle: Browser camera relay: Cloudflare TURN configured."
+    if has_turn_credential:
+        return ":material/check_circle: Browser camera relay: TURN relay configured."
+    return ":material/info: Browser camera relay: STUN configured."
+
+
 def render_browser_camera_widget(playing: bool) -> None:
     if not WEBRTC_AVAILABLE:
         if playing:
             st.error(
                 "Browser camera mode requires the `streamlit-webrtc` and `av` packages, "
                 "which are listed in requirements.txt but failed to import. Check the "
-                "deployment logs."
+                "deployment logs — this is usually a missing system library (see "
+                "packages.txt: libavformat-dev, libavdevice-dev, libgl1)."
             )
         return
 
-    ctx = webrtc_streamer(
-        key="cybervision-browser-camera",
-        mode=WebRtcMode.SENDONLY,
-        desired_playing_state=playing,
-        rtc_configuration=RTCConfiguration({"iceServers": get_ice_servers()}),
-        media_stream_constraints={"video": True, "audio": False},
-        video_processor_factory=BrowserCameraProcessor,
-        async_processing=True,
-    )
+    with st.container(key="webrtc_transport"):
+        ctx = webrtc_streamer(
+            key="cybervision-browser-camera",
+            mode=WebRtcMode.SENDONLY,
+            desired_playing_state=playing,
+            rtc_configuration=RTCConfiguration({"iceServers": get_ice_servers()}),
+            media_stream_constraints={"video": True, "audio": False},
+            video_processor_factory=BrowserCameraProcessor,
+            video_html_attrs=VideoHTMLAttributes(
+                autoPlay=True, controls=False, muted=True, style={"display": "none"}
+            ),
+            media_toggle_controls=False,
+            async_processing=True,
+        )
     st.session_state.webrtc_ctx = ctx
 
 
@@ -1306,8 +1349,7 @@ class VideoCaptureManager:
             return {}, None
 
         primary_frame = cv2.resize(frame, (CONFIG["FRAME_WIDTH"], CONFIG["FRAME_HEIGHT"]))
-        grid_frames = {i: frame.copy() for i in range(9)}
-        return grid_frames, primary_frame
+        return {0: frame}, primary_frame
 
     @staticmethod
     def _capture_from_local_devices() -> Tuple[Dict[int, np.ndarray], Optional[np.ndarray]]:
@@ -1321,8 +1363,6 @@ class VideoCaptureManager:
 
         for idx, cap in list(caps.items()):
             if cap.isOpened():
-                for _ in range(2):
-                    cap.grab()
                 ret, frame = cap.read()
                 if ret and frame is not None:
                     active_frames[idx] = frame
@@ -1989,8 +2029,7 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
 
     VLMInference.drain_worker_queue()
 
-    visual_result = VisualFireSmokeDetector.detect(frame)
-
+    # 1. Primary Object Detection (YOLO)
     yolo_detector = st.session_state.get("yolo_detector")
     if yolo_detector is None:
         yolo_detector = YOLOFireSmokeDetector()
@@ -2011,20 +2050,14 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
             "classes": [], "annotated_frame": frame,
         }
 
+    # Primary YOLO severity drives system alert state
     yolo_severity = yolo_detector.hazard_severity(yolo_result) if yolo_result.get("detected") else "NORMAL"
     st.session_state.yolo_severity = yolo_severity
 
-    if SEVERITY_STYLE[yolo_severity]["score"] > SEVERITY_STYLE[visual_result["visual_severity"]]["score"]:
-        visual_result["visual_severity"] = yolo_severity
-        if yolo_result.get("detections"):
-            first = yolo_result["detections"][0]
-            visual_result["visual_keyword"] = f"yolo_{first['class']}_{first['confidence']:.2f}"
+    visual_result = VisualFireSmokeDetector.detect(frame)
 
-    candidate_hazard = (
-        yolo_result.get("detected", False)
-        or visual_result.get("visual_severity", "NORMAL") != "NORMAL"
-    )
-
+    # VLM trigger ONLY fires when YOLO actually detects a hazard
+    candidate_hazard = yolo_result.get("detected", False)
     analyze_this_frame = (
         candidate_hazard
         and frame_number % max(1, CONFIG["ANALYZE_EVERY_N_FRAMES"]) == 0
@@ -2047,27 +2080,41 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
         detection_text = ", ".join(f"{d['class']} {d['confidence']:.0%}" for d in yolo_result["detections"])
         public_description = f"YOLO detected: {detection_text}. VLM: {vlm_text}"
 
+    is_hazard = yolo_result.get("detected", False)
+    confidence = yolo_result.get("highest_confidence", 0.0) if is_hazard else 0.0
+
     alert = {
         "timestamp": datetime.now().strftime("%H:%M:%S"),
         "description": public_description,
         "success": True,
         "latency": latency,
-        "verified": verdict["is_hazard"],
-        "yolo_detected": yolo_result.get("detected", False),
+        "verified": is_hazard,
+        "yolo_detected": is_hazard,
         "yolo_classes": ", ".join(yolo_result.get("classes", [])),
-        "yolo_confidence": yolo_result.get("highest_confidence", 0.0),
-        **verdict,
+        "yolo_confidence": confidence,
+        "severity": yolo_severity,
+        "is_hazard": is_hazard,
+        "confidence": confidence,
+        "matched_keyword": verdict.get("matched_keyword", "none"),
+        "matched_source": "YOLO_DETECTOR" if is_hazard else "SYSTEM",
+        "yara_severity": verdict.get("yara_severity", "NORMAL"),
+        "visual_severity": visual_result.get("visual_severity", "NORMAL"),
+        "fire_ratio": visual_result.get("fire_ratio", 0.0),
+        "smoke_ratio": visual_result.get("smoke_ratio", 0.0),
+        "yara_available": YARA_AVAILABLE,
     }
 
     st.session_state.alert_history.append(alert)
     st.session_state.latest_detection = alert
 
-    hazard_title = determine_hazard_title(alert)
-    dispatch_hazard_alerts(alert["severity"], hazard_title)
+    # Trigger alerts ONLY if YOLO identifies fire or smoke
+    if yolo_severity != "NORMAL":
+        hazard_title = determine_hazard_title(alert)
+        dispatch_hazard_alerts(yolo_severity, hazard_title)
 
-    play_critical_alarm(alert["severity"] == "CRITICAL")
+    play_critical_alarm(yolo_severity == "CRITICAL")
 
-    if verdict["is_hazard"]:
+    if is_hazard:
         upload_to_google_cloud_async(frame, alert)
 
     return {
@@ -2368,20 +2415,20 @@ def render_resource_trend_preview() -> None:
 # =============================================================================
 # LIVE VIDEO STREAM (FULL-WIDTH 3x3 MATRIX)
 # =============================================================================
-def render_video_frame(video_placeholder, status_placeholder) -> None:
+@st.fragment(run_every=0.5)
+def live_camera_fragment(video_placeholder) -> None:
     render_custom_hazard_toast()
 
     if not st.session_state.get("camera_running", False):
-        if st.session_state.get("last_frame_rgb") is not None:
-            video_placeholder.image(st.session_state.last_frame_rgb, use_container_width=True)
-        else:
-            video_placeholder.image(
-                VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
-                use_container_width=True,
-            )
-        status_placeholder.info("Camera is stopped. Detection paused.")
         return
 
+    # Detection (YOLO/VLM/YARA) can take several seconds per frame. The
+    # fragment timer above still fires every 0.5s regardless, and if a new
+    # tick starts work while the previous one is still running, Streamlit
+    # tears down and rebuilds the fragment mid-flight — that's what made the
+    # feed flash on and off. This guard makes a busy tick a cheap no-op
+    # instead, so the last successfully drawn frame just stays on screen
+    # until the next one is ready.
     if st.session_state.get("_frame_processing_busy"):
         return
 
@@ -2390,13 +2437,7 @@ def render_video_frame(video_placeholder, status_placeholder) -> None:
         active_frames, primary_frame = VideoCaptureManager.capture_active_frames()
 
         if primary_frame is None and not active_frames:
-            # Display real-time capture failure reason if camera streams aren't providing frames
-            placeholder_img = VideoCaptureManager.placeholder_frame(
-                "Awaiting Camera Frame", 
-                st.session_state.get("last_error", "Initializing camera stream...")
-            )
-            video_placeholder.image(placeholder_img, use_container_width=True)
-            status_placeholder.error(st.session_state.get("last_error") or "Camera stream unavailable.")
+            st.error(st.session_state.get("last_error") or "Camera unavailable.")
             return
 
         current_time = time.time()
@@ -2409,7 +2450,7 @@ def render_video_frame(video_placeholder, status_placeholder) -> None:
 
         pipeline_result = run_detection_pipeline(primary_frame)
 
-        if pipeline_result.get("annotated_frame") is not None:
+        if 0 in active_frames and pipeline_result.get("annotated_frame") is not None:
             active_frames[0] = pipeline_result["annotated_frame"]
 
         grid_matrix = construct_3x3_grid(active_frames)
@@ -2431,24 +2472,10 @@ def render_video_frame(video_placeholder, status_placeholder) -> None:
         grid_rgb = cv2.cvtColor(grid_matrix, cv2.COLOR_BGR2RGB)
         st.session_state.last_frame_rgb = grid_rgb
 
+        # Smooth persistent container update avoids widget flickering/stutter
         video_placeholder.image(grid_rgb, channels="RGB", use_container_width=True)
-
-        if not YOLO_AVAILABLE:
-            status_placeholder.warning("Ultralytics is not installed.")
-        elif not is_yolo_model_available():
-            status_placeholder.warning("YOLO model not found.")
-        elif yolo_result.get("detected"):
-            detections = ", ".join(f"{d['class']} ({d['confidence']:.0%})" for d in yolo_result.get("detections", []))
-            status_placeholder.warning(f"YOLO detection: {detections}")
-        else:
-            status_placeholder.success("Live 3x3 multi-camera monitoring active...")
     finally:
         st.session_state._frame_processing_busy = False
-
-
-@st.fragment(run_every=0.2)
-def live_camera_fragment(video_container, status_container):
-    render_video_frame(video_container, status_container)
 
 
 def render_video_feed() -> None:
@@ -2483,14 +2510,14 @@ def render_video_feed() -> None:
     if st.session_state.get("webrtc_unavailable_on_cloud"):
         st.error(
             "This deployment has no local camera device, and the browser-camera "
-            "(streamlit-webrtc) packages failed to load — see the deployment logs."
+            "(streamlit-webrtc) packages failed to load — see the deployment logs. "
+            "Detection cannot start until that's fixed."
         )
 
     if st.session_state.get("use_webrtc"):
         render_browser_camera_widget(playing=st.session_state.camera_running)
 
     video_placeholder = st.empty()
-    status_placeholder = st.empty()
 
     if not st.session_state.camera_running:
         if st.session_state.get("last_frame_rgb") is not None:
@@ -2500,10 +2527,10 @@ def render_video_feed() -> None:
                 VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
                 use_container_width=True,
             )
-        status_placeholder.info("Camera is stopped. Detection paused.")
+        st.info("Camera is stopped. Detection paused.")
         return
 
-    live_camera_fragment(video_placeholder, status_placeholder)
+    live_camera_fragment(video_placeholder)
 
 
 def _build_forensic_display_df() -> Optional[pd.DataFrame]:
