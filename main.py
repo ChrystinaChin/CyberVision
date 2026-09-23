@@ -145,6 +145,7 @@ CONFIG: Dict[str, Any] = {
     "YOLO_CONFIDENCE": 0.45,
     "YOLO_IMAGE_SIZE": 160,       # Reduced from 320 to accelerate CPU inference
     "YOLO_EVERY_N_FRAMES": 6,     # Run real inference every 6th tick; reuse last result otherwise
+    "VISUAL_DETECT_EVERY_N_FRAMES": 3,  # HSV/YCrCb color analysis is CPU-heavy; don't run it every tick
 }
 
 SEVERITY_STYLE = {
@@ -1272,6 +1273,13 @@ def render_browser_camera_widget(playing: bool) -> None:
 # MULTI-CAMERA HANDLING & 3x3 MATRIX (OPTIMIZED NON-BLOCKING)
 # =============================================================================
 @st.cache_resource(show_spinner=False)
+def _get_camera_read_executor(n_workers: int) -> ThreadPoolExecutor:
+    # One long-lived pool, reused across every fragment tick instead of
+    # being created and torn down every 100ms.
+    return ThreadPoolExecutor(max_workers=max(1, n_workers))
+
+
+@st.cache_resource(show_spinner=False)
 def get_camera_caps() -> Dict[int, cv2.VideoCapture]:
     caps = {}
 
@@ -1381,13 +1389,18 @@ class VideoCaptureManager:
                     return idx, frame
             return idx, None
 
-        with ThreadPoolExecutor(max_workers=max(1, len(caps))) as executor:
-            results = executor.map(_read_cam, caps.items())
-            for idx, frame in results:
-                if frame is not None:
-                    active_frames[idx] = frame
-                    if primary_frame is None:
-                        primary_frame = cv2.resize(frame, (CONFIG["FRAME_WIDTH"], CONFIG["FRAME_HEIGHT"]))
+        # Single camera: skip threading entirely, it's pure overhead.
+        if len(caps) == 1:
+            results = [_read_cam(item) for item in caps.items()]
+        else:
+            executor = _get_camera_read_executor(len(caps))
+            results = list(executor.map(_read_cam, caps.items()))
+
+        for idx, frame in results:
+            if frame is not None:
+                active_frames[idx] = frame
+                if primary_frame is None:
+                    primary_frame = cv2.resize(frame, (CONFIG["FRAME_WIDTH"], CONFIG["FRAME_HEIGHT"]))
 
         return active_frames, primary_frame
 
@@ -2117,7 +2130,15 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
     yolo_severity = yolo_detector.hazard_severity(yolo_result) if yolo_result.get("detected") else "NORMAL"
     st.session_state.yolo_severity = yolo_severity
 
-    visual_result = VisualFireSmokeDetector.detect(frame)
+    run_visual_now = (
+        st.session_state.get("last_visual_result") is None
+        or frame_number % max(1, CONFIG["VISUAL_DETECT_EVERY_N_FRAMES"]) == 0
+    )
+    if run_visual_now:
+        visual_result = VisualFireSmokeDetector.detect(frame)
+        st.session_state.last_visual_result = visual_result
+    else:
+        visual_result = st.session_state.last_visual_result
 
     candidate_hazard = yolo_result.get("detected", False)
     analyze_this_frame = (
