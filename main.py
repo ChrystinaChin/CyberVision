@@ -3,6 +3,7 @@ import io
 import json
 import os
 import queue
+import re
 import socket
 import sqlite3
 import threading
@@ -460,9 +461,19 @@ def inject_custom_css() -> None:
         --------------------------------------------------------------- */
         .hazard-toast {{
             position: fixed;
-            top: 1.1rem;
+            /* Streamlit's own header/toolbar (the "Share" / "⋮" bar,
+               [data-testid="stHeader"]) renders in its own stacking context
+               with a z-index far above ours (Streamlit uses six-figure
+               values like 999990+ for it). At top:1.1rem the toast's top
+               edge sat underneath that bar, so its gradient background
+               visually blended with the toast's text and made it unreadable
+               even though the toast itself was fully rendered. Two
+               independent fixes, applied together so this can't regress
+               either way: clear the header's height outright (~3.7rem is
+               Streamlit's default header height) AND out-rank its z-index. */
+            top: 4.5rem;
             right: 1.1rem;
-            z-index: 9999;
+            z-index: 1000000;
             background: #ffffff;
             border: 1px solid {border};
             border-left: 7px solid {accent};
@@ -1223,12 +1234,24 @@ def get_gcp_clients() -> Tuple[Optional[Any], Optional[Any]]:
 STUN_ONLY_ICE_SERVERS = [{"urls": ["stun:stun.l.google.com:19302"]}]
 
 
+# Module-level (not st.session_state) because get_ice_servers() below is
+# @st.cache_data'd with no arguments: it only *executes* the first time it's
+# called within the TTL window, and every other session just gets the
+# cached return value without this code running again. session_state
+# writes here would therefore only ever reach whichever session happened
+# to trigger the real fetch. This dict is purely a best-effort debug
+# surface (see the "Server Setup" panel) for "which tier did we actually
+# get, and why" — it is not used for any connection logic.
+ICE_SERVER_DIAGNOSTICS: Dict[str, str] = {"tier": "unknown", "detail": ""}
+
+
 def _fetch_cloudflare_ice_servers(key_id: str, api_token: str) -> Optional[list]:
     """Mints a short-lived (24h TTL) TURN credential via Cloudflare's
     Realtime TURN API. The long-lived API token stays server-side; only the
     generated username/credential pair is handed to the browser. See
     https://developers.cloudflare.com/realtime/turn/generate-credentials/"""
     if not REQUESTS_AVAILABLE:
+        ICE_SERVER_DIAGNOSTICS["detail"] = "`requests` package is not installed/importable."
         return None
     try:
         resp = requests.post(
@@ -1244,18 +1267,32 @@ def _fetch_cloudflare_ice_servers(key_id: str, api_token: str) -> Optional[list]
         ice_servers = resp.json().get("iceServers") or []
         # Cloudflare may return an alternate port-53 URL. Browsers can block
         # that port, while the same response contains other TURN transports.
+        # NOTE: must match port 53 EXACTLY (":53" at the end, or right before
+        # a "?transport=..." suffix). A plain substring check ("':53' in u")
+        # also matches ":5349" (TURNS/TLS) and would silently strip that
+        # entry too, quietly removing one of the two firewall-friendly
+        # relay transports (leaving only the 443 TURNS fallback) and making
+        # already-marginal networks that much more likely to never get past
+        # "Waiting for first frame from browser camera...".
+        port_53_pattern = re.compile(r":53(?:\?|$)")
         filtered = []
         for server in ice_servers:
             urls = server.get("urls", [])
             if isinstance(urls, str):
                 urls = [urls]
-            urls = [u for u in urls if ":53" not in u]
+            urls = [u for u in urls if not port_53_pattern.search(u)]
             if urls:
                 item = dict(server)
                 item["urls"] = urls
                 filtered.append(item)
-        return filtered or None
-    except Exception:
+        if not filtered:
+            ICE_SERVER_DIAGNOSTICS["detail"] = (
+                "Cloudflare returned iceServers but every entry was filtered out."
+            )
+            return None
+        return filtered
+    except Exception as exc:
+        ICE_SERVER_DIAGNOSTICS["detail"] = f"Cloudflare TURN request failed: {exc}"
         return None
 
 
@@ -1264,6 +1301,7 @@ def _fetch_metered_ice_servers(api_key: str, domain: str) -> Optional[list]:
     that needs only an API key + your Metered subdomain, no Twilio-style
     account. See https://www.metered.ca/tools/openrelay/"""
     if not REQUESTS_AVAILABLE:
+        ICE_SERVER_DIAGNOSTICS["detail"] = "`requests` package is not installed/importable."
         return None
     try:
         resp = requests.get(
@@ -1274,7 +1312,8 @@ def _fetch_metered_ice_servers(api_key: str, domain: str) -> Optional[list]:
         resp.raise_for_status()
         ice_servers = resp.json()
         return ice_servers or None
-    except Exception:
+    except Exception as exc:
+        ICE_SERVER_DIAGNOSTICS["detail"] = f"Metered TURN request failed: {exc}"
         return None
 
 
@@ -1302,14 +1341,22 @@ def get_ice_servers() -> list:
     if cf_key_id and cf_api_token:
         ice_servers = _fetch_cloudflare_ice_servers(cf_key_id, cf_api_token)
         if ice_servers:
+            ICE_SERVER_DIAGNOSTICS.update(tier="cloudflare", detail="TURN credentials minted OK.")
             return ice_servers
+    else:
+        ICE_SERVER_DIAGNOSTICS["detail"] = (
+            "CLOUDFLARE_TURN_KEY_ID / CLOUDFLARE_TURN_KEY_API_TOKEN not set "
+            "(checked env vars and st.secrets)."
+        )
 
     metered_key, metered_domain = _get_metered_credentials()
     if metered_key and metered_domain:
         ice_servers = _fetch_metered_ice_servers(metered_key, metered_domain)
         if ice_servers:
+            ICE_SERVER_DIAGNOSTICS.update(tier="metered", detail="TURN credentials fetched OK.")
             return ice_servers
 
+    ICE_SERVER_DIAGNOSTICS["tier"] = "stun-only"
     return STUN_ONLY_ICE_SERVERS
 
 
@@ -2355,6 +2402,23 @@ def render_dashboard_settings_panel() -> None:
                 st.caption(":material/warning: No GCP credentials found (secrets, env var, or key file).")
             else:
                 st.caption(":material/check_circle: GCP credentials loaded.")
+
+        if st.session_state.get("use_webrtc"):
+            get_ice_servers()  # ensures ICE_SERVER_DIAGNOSTICS reflects the tier actually in use
+            tier = ICE_SERVER_DIAGNOSTICS["tier"]
+            detail = ICE_SERVER_DIAGNOSTICS["detail"]
+            if tier == "cloudflare":
+                st.caption(f":material/check_circle: Browser camera relay: Cloudflare TURN. {detail}")
+            elif tier == "metered":
+                st.caption(f":material/check_circle: Browser camera relay: Metered TURN. {detail}")
+            elif tier == "stun-only":
+                st.caption(
+                    f":material/warning: Browser camera relay: STUN only — {detail} "
+                    "STUN-only is the config most likely to hang at "
+                    "'Waiting for first frame' on a hosted/firewalled network."
+                )
+            else:
+                st.caption(":material/help: Browser camera relay: not yet determined.")
 
         timeout_option = st.selectbox(
             "Inference timeout target",
