@@ -3,6 +3,7 @@ import io
 import json
 import os
 import queue
+import re
 import socket
 import sqlite3
 import threading
@@ -48,11 +49,71 @@ except Exception:
 
 try:
     from google.cloud import firestore, storage
+    from google.oauth2 import service_account as gcp_service_account
     GCP_AVAILABLE = True
 except Exception:
     storage = None
     firestore = None
+    gcp_service_account = None
     GCP_AVAILABLE = False
+
+try:
+    from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase, RTCConfiguration
+    WEBRTC_AVAILABLE = True
+except Exception:
+    webrtc_streamer = None
+    WebRtcMode = None
+    VideoProcessorBase = object
+    RTCConfiguration = None
+    WEBRTC_AVAILABLE = False
+
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except Exception:
+    requests = None
+    REQUESTS_AVAILABLE = False
+
+
+def is_cloud_environment() -> bool:
+    """Detect a hosted environment (e.g. Streamlit Community Cloud) that has
+    no physical camera device attached, so cv2.VideoCapture can never work
+    there and the app should fall back to capturing the visitor's own
+    browser camera over WebRTC instead.
+
+    Order of checks:
+    1. Explicit manual override via env vars (useful for testing either path).
+    2. Streamlit Community Cloud checks the repo out under /mount/src/<repo>.
+    3. Streamlit Community Cloud containers run as the "appuser" user.
+    """
+    force_webrtc = os.environ.get("CYBERVISION_FORCE_WEBRTC", "").strip().lower()
+    if force_webrtc in ("1", "true", "yes"):
+        return True
+
+    force_local = os.environ.get("CYBERVISION_FORCE_LOCAL_CAMERA", "").strip().lower()
+    if force_local in ("1", "true", "yes"):
+        return False
+
+    if os.path.exists("/mount/src"):
+        return True
+
+    if os.environ.get("HOME") == "/home/appuser":
+        return True
+
+    return False
+
+
+def local_camera_available() -> bool:
+    """Best-effort probe for a real, locally-attached camera device. Used as
+    a fallback signal in case is_cloud_environment() doesn't recognize the
+    hosting platform but no local camera actually exists."""
+    try:
+        probe = cv2.VideoCapture(CONFIG["CAMERA_SOURCES"][0])
+        opened = probe.isOpened()
+        probe.release()
+        return opened
+    except Exception:
+        return False
 
 
 # =============================================================================
@@ -76,26 +137,20 @@ CONFIG: Dict[str, Any] = {
     "LATENCY_HISTORY_MAX": 100,
     "TOAST_DISPLAY_SECONDS": 6.0,
     "YARA_RULE_PATH": "hazard_rules.yar",
-    "GCP_BUCKET": "your-gcp-bucket-name",
-    "GCP_PROJECT_ID": "your-gcp-project-id",
+    # Fill these in with your real GCS bucket + GCP project — cloud backup
+    # stays disabled (silently, by design) as long as GCP_BUCKET is left at
+    # this placeholder. See _get_gcp_service_account_info() for how
+    # credentials are supplied (Streamlit secrets / env var / local key file).
+    "GCP_BUCKET": "cybervision_history",
+    "GCP_PROJECT_ID": "c5c505d599a4735f61c6c6896dd3f47a2c28337b",
     "DB_FILE": "cybervision_buffer.db",
     "PENDING_UPLOADS_DIR": "pending_gcp_uploads",
     "YOLO_MODEL_PATH": os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
         "YOLO_dataset.pt",
     ),
-    # 0.45 conf + a 320px inference size was filtering out and downscaling
-    # away real fire on live camera frames (motion blur, partial framing,
-    # non-ideal lighting) — the detection would then legitimately fall
-    # under the cutoff and no box gets drawn at all, since `conf` is
-    # applied inside the model call itself (see YOLOFireSmokeDetector.detect
-    # below), not after. Lowering the threshold and inferring at the frame's
-    # native 640px width trades a few more borderline/false-positive boxes
-    # for meaningfully better recall on real fire; YARA/visual analysis in
-    # YARAVerifier.verify() already double-checks every reading downstream,
-    # so a slightly noisier YOLO signal doesn't weaken the overall alerting.
-    "YOLO_CONFIDENCE": 0.25,
-    "YOLO_IMAGE_SIZE": 640,
+    "YOLO_CONFIDENCE": 0.45,
+    "YOLO_IMAGE_SIZE": 320,
 }
 
 SEVERITY_STYLE = {
@@ -150,7 +205,9 @@ def sync_worker_loop() -> None:
     while True:
         if is_wifi_connected() and GCP_AVAILABLE and firestore is not None:
             try:
-                db_client = firestore.Client(project=CONFIG["GCP_PROJECT_ID"])
+                _, db_client = get_gcp_clients()
+                if db_client is None:
+                    raise RuntimeError("GCP credentials not configured")
                 with sqlite3.connect(CONFIG["DB_FILE"]) as conn:
                     cursor = conn.cursor()
                     cursor.execute("SELECT id, timestamp, severity, description, camera_id FROM pending_events WHERE synced = 0")
@@ -217,11 +274,21 @@ def init_session_state() -> None:
         "last_triggered_alert_ts": 0.0,
         "active_hazard_toast": None,
         "active_page": "Dashboard",
+        "webrtc_ctx": None,
     }
 
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+    if "use_webrtc" not in st.session_state:
+        # Decide once per session which capture path to use: browser WebRTC
+        # (needed on hosted platforms with no physical camera) or the local
+        # cv2.VideoCapture multi-camera path (for running on a machine that
+        # actually has camera hardware attached, e.g. local development).
+        needs_browser_camera = is_cloud_environment() or not local_camera_available()
+        st.session_state.use_webrtc = needs_browser_camera and WEBRTC_AVAILABLE
+        st.session_state.webrtc_unavailable_on_cloud = needs_browser_camera and not WEBRTC_AVAILABLE
 
 
 @st.cache_data
@@ -394,9 +461,19 @@ def inject_custom_css() -> None:
         --------------------------------------------------------------- */
         .hazard-toast {{
             position: fixed;
-            top: 1.1rem;
+            /* Streamlit's own header/toolbar (the "Share" / "⋮" bar,
+               [data-testid="stHeader"]) renders in its own stacking context
+               with a z-index far above ours (Streamlit uses six-figure
+               values like 999990+ for it). At top:1.1rem the toast's top
+               edge sat underneath that bar, so its gradient background
+               visually blended with the toast's text and made it unreadable
+               even though the toast itself was fully rendered. Two
+               independent fixes, applied together so this can't regress
+               either way: clear the header's height outright (~3.7rem is
+               Streamlit's default header height) AND out-rank its z-index. */
+            top: 4.5rem;
             right: 1.1rem;
-            z-index: 9999;
+            z-index: 1000000;
             background: #ffffff;
             border: 1px solid {border};
             border-left: 7px solid {accent};
@@ -774,6 +851,26 @@ def inject_custom_css() -> None:
         .video-status-bar b {{
             color: {accent_dark};
         }}
+
+        /* WebRTC transport is intentionally invisible. The dashboard's
+           Start button is the only user-facing camera control and the custom
+           3x3 matrix is the only visible camera feed. */
+        .st-key-webrtc_transport {{
+            height: 0 !important;
+            min-height: 0 !important;
+            max-height: 0 !important;
+            overflow: hidden !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            border: 0 !important;
+        }}
+        .st-key-webrtc_transport iframe {{
+            height: 1px !important;
+            min-height: 1px !important;
+            max-height: 1px !important;
+            opacity: 0 !important;
+            pointer-events: none !important;
+        }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -1006,7 +1103,389 @@ class ResourceGovernor:
 
 
 # =============================================================================
-# MULTI-CAMERA HANDLING & 3x3 MATRIX
+# BROWSER CAMERA (WEBRTC) — used on hosted deployments with no physical
+# camera attached (e.g. Streamlit Community Cloud). Captures the visitor's
+# own device camera in the browser and streams frames to the server.
+# =============================================================================
+if WEBRTC_AVAILABLE:
+    from streamlit_webrtc import VideoHTMLAttributes
+
+    class BrowserCameraProcessor(VideoProcessorBase):
+        """Stores only the most recent frame received from the browser so the
+        0.1s detection fragment can grab it without blocking on the media
+        stream itself."""
+
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self._latest_frame: Optional[np.ndarray] = None
+
+        def recv(self, frame):
+            img = frame.to_ndarray(format="bgr24")
+            with self._lock:
+                self._latest_frame = img
+            return frame
+
+        def get_latest_frame(self) -> Optional[np.ndarray]:
+            with self._lock:
+                return None if self._latest_frame is None else self._latest_frame.copy()
+else:
+    BrowserCameraProcessor = None
+    VideoHTMLAttributes = None
+
+
+def _get_secret(name: str) -> Optional[str]:
+    """Read a credential from env vars first, then Streamlit secrets."""
+    value = os.environ.get(name)
+    if value:
+        return value
+    try:
+        return st.secrets.get(name)
+    except Exception:
+        return None
+
+
+def _get_cloudflare_turn_credentials() -> Tuple[Optional[str], Optional[str]]:
+    key_id = _get_secret("CLOUDFLARE_TURN_KEY_ID")
+    api_token = _get_secret("CLOUDFLARE_TURN_KEY_API_TOKEN")
+    return key_id, api_token
+
+
+def _get_metered_credentials() -> Tuple[Optional[str], Optional[str]]:
+    api_key = _get_secret("METERED_API_KEY")
+    domain = _get_secret("METERED_DOMAIN")  # e.g. "your-app.metered.live"
+    return api_key, domain
+
+
+# =============================================================================
+# GOOGLE CLOUD CREDENTIALS
+# =============================================================================
+def _get_gcp_service_account_info() -> Optional[dict]:
+    """Resolve GCP service-account credentials without depending on a JSON
+    key file being present inside the deployed container (Streamlit
+    Community Cloud has no way to receive that file securely — anything
+    committed to the repo is public). Checked in order:
+
+    1. GCP_SERVICE_ACCOUNT_JSON env var — the whole key file contents as a
+       single string. Handy for Docker/VM deployments where secrets are
+       injected as environment variables.
+    2. st.secrets["gcp_service_account"] — a [gcp_service_account] TOML
+       table pasted into Streamlit Cloud's Secrets manager. This is the
+       recommended path for Streamlit Community Cloud.
+    3. A local service_account.json file next to this script — convenient
+       for local development only. Never commit this file to git; keep it
+       out of the repo (.gitignore) since it's a plaintext credential.
+    """
+    raw = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
+    if raw:
+        try:
+            return json.loads(raw)
+        except Exception:
+            pass
+
+    try:
+        if "gcp_service_account" in st.secrets:
+            return dict(st.secrets["gcp_service_account"])
+    except Exception:
+        pass
+
+    local_key_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "service_account.json"
+    )
+    if os.path.isfile(local_key_path):
+        try:
+            with open(local_key_path, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+
+    return None
+
+
+@st.cache_resource(show_spinner=False)
+def get_gcp_clients() -> Tuple[Optional[Any], Optional[Any]]:
+    """Cached (storage_client, firestore_client) pair, built once per
+    session. Prefers an explicit service-account key from
+    _get_gcp_service_account_info() (env var, Streamlit secrets, or a local
+    file); falls back to Application Default Credentials, which only work
+    when running on GCP infrastructure (GCE/Cloud Run) or after a local
+    `gcloud auth application-default login` — NOT on Streamlit Community
+    Cloud. Returns (None, None) if neither the library nor any credentials
+    are available, so every caller must check before using the result."""
+    if not GCP_AVAILABLE:
+        return None, None
+
+    info = _get_gcp_service_account_info()
+    project_id = CONFIG["GCP_PROJECT_ID"]
+
+    try:
+        if info and gcp_service_account is not None:
+            credentials = gcp_service_account.Credentials.from_service_account_info(info)
+            project_id = info.get("project_id", project_id)
+            storage_client = storage.Client(credentials=credentials, project=project_id)
+            db_client = firestore.Client(credentials=credentials, project=project_id)
+        else:
+            storage_client = storage.Client(project=project_id)
+            db_client = firestore.Client(project=project_id)
+        return storage_client, db_client
+    except Exception:
+        return None, None
+
+
+STUN_ONLY_ICE_SERVERS = [{"urls": ["stun:stun.l.google.com:19302"]}]
+
+
+# Module-level (not st.session_state) because get_ice_servers() below is
+# @st.cache_data'd with no arguments: it only *executes* the first time it's
+# called within the TTL window, and every other session just gets the
+# cached return value without this code running again. session_state
+# writes here would therefore only ever reach whichever session happened
+# to trigger the real fetch. This dict is purely a best-effort debug
+# surface (see the "Server Setup" panel) for "which tier did we actually
+# get, and why" — it is not used for any connection logic.
+ICE_SERVER_DIAGNOSTICS: Dict[str, str] = {"tier": "unknown", "detail": ""}
+
+
+def _fetch_cloudflare_ice_servers(key_id: str, api_token: str) -> Optional[list]:
+    """Mints a short-lived (24h TTL) TURN credential via Cloudflare's
+    Realtime TURN API. The long-lived API token stays server-side; only the
+    generated username/credential pair is handed to the browser. See
+    https://developers.cloudflare.com/realtime/turn/generate-credentials/"""
+    if not REQUESTS_AVAILABLE:
+        ICE_SERVER_DIAGNOSTICS["detail"] = "`requests` package is not installed/importable."
+        return None
+    try:
+        resp = requests.post(
+            f"https://rtc.live.cloudflare.com/v1/turn/keys/{key_id}/credentials/generate-ice-servers",
+            headers={
+                "Authorization": f"Bearer {api_token}",
+                "Content-Type": "application/json",
+            },
+            json={"ttl": 86400},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        ice_servers = resp.json().get("iceServers") or []
+        # Cloudflare may return an alternate port-53 URL. Browsers can block
+        # that port, while the same response contains other TURN transports.
+        # NOTE: must match port 53 EXACTLY (":53" at the end, or right before
+        # a "?transport=..." suffix). A plain substring check ("':53' in u")
+        # also matches ":5349" (TURNS/TLS) and would silently strip that
+        # entry too, quietly removing one of the two firewall-friendly
+        # relay transports (leaving only the 443 TURNS fallback) and making
+        # already-marginal networks that much more likely to never get past
+        # "Waiting for first frame from browser camera...".
+        port_53_pattern = re.compile(r":53(?:\?|$)")
+        filtered = []
+        for server in ice_servers:
+            urls = server.get("urls", [])
+            if isinstance(urls, str):
+                urls = [urls]
+            urls = [u for u in urls if not port_53_pattern.search(u)]
+            if urls:
+                item = dict(server)
+                item["urls"] = urls
+                filtered.append(item)
+        if not filtered:
+            ICE_SERVER_DIAGNOSTICS["detail"] = (
+                "Cloudflare returned iceServers but every entry was filtered out."
+            )
+            return None
+        return filtered
+    except Exception as exc:
+        ICE_SERVER_DIAGNOSTICS["detail"] = f"Cloudflare TURN request failed: {exc}"
+        return None
+
+
+def _fetch_metered_ice_servers(api_key: str, domain: str) -> Optional[list]:
+    """Metered.ca / Open Relay Project TURN credentials — a free alternative
+    that needs only an API key + your Metered subdomain, no Twilio-style
+    account. See https://www.metered.ca/tools/openrelay/"""
+    if not REQUESTS_AVAILABLE:
+        ICE_SERVER_DIAGNOSTICS["detail"] = "`requests` package is not installed/importable."
+        return None
+    try:
+        resp = requests.get(
+            f"https://{domain}/api/v1/turn/credentials",
+            params={"apiKey": api_key},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        ice_servers = resp.json()
+        return ice_servers or None
+    except Exception as exc:
+        ICE_SERVER_DIAGNOSTICS["detail"] = f"Metered TURN request failed: {exc}"
+        return None
+
+
+def get_ice_servers() -> list:
+    """Three-tier ICE server strategy, cheapest/simplest first:
+
+    1. Google's free public STUN server (STUN_ONLY_ICE_SERVERS) — zero setup,
+       works fine when the network path between browser and server allows
+       direct/STUN-negotiated UDP. This is what's used if neither TURN
+       option below is configured, and is always the final fallback.
+    2. Cloudflare Realtime TURN (recommended by the streamlit-webrtc
+       maintainers for platforms like Streamlit Community Cloud, whose
+       firewall blocks plain STUN-negotiated connections) — used when
+       CLOUDFLARE_TURN_KEY_ID / CLOUDFLARE_TURN_KEY_API_TOKEN are configured
+       (env vars or Streamlit secrets).
+    3. Metered.ca / Open Relay Project — a free TURN alternative, used when
+       METERED_API_KEY / METERED_DOMAIN are configured instead of Cloudflare.
+
+    Whichever TURN tier is configured takes priority over plain STUN, since
+    STUN alone is the one most likely to leave the stream stuck at
+    "Waiting for first frame" on a hosted platform.
+
+    Cached in st.session_state (NOT @st.cache_data): a process-wide cache
+    here means every visitor, and every reconnect from the SAME visitor
+    (e.g. a plain browser refresh, which always tears down and rebuilds
+    the browser-side RTCPeerConnection from scratch) would be handed the
+    exact same TURN username/credential pair for as long as the cache TTL
+    lasts. Two independent WebRTC sessions racing to open allocations on
+    one shared credential is a plausible way for a connection that worked
+    a minute ago to fail right after a refresh, and it's indistinguishable
+    from the browser side from any other ICE failure — it just looks like
+    "stuck at Waiting for first frame" again. Keying the cache off
+    st.session_state instead gives every new session (hence every refresh)
+    its own freshly-minted credential, while still only paying for one
+    network round-trip per session for the ttl_seconds below.
+    """
+    cache_key = "_ice_servers_cache"
+    diag_key = "_ice_server_diagnostics_cache"
+    ttl_seconds = 3000
+
+    # ICE_SERVER_DIAGNOSTICS is a module-level dict, but Streamlit re-runs
+    # this entire script top-to-bottom on every interaction, which re-runs
+    # the `ICE_SERVER_DIAGNOSTICS: Dict[str, str] = {...}` assignment at
+    # module scope too and wipes out whatever the last real check found.
+    # Combined with the st.session_state cache below (which DOES survive
+    # reruns), that made the "Last-fetch detail" caption go blank on every
+    # rerun after the one that actually performed the fetch — hiding the
+    # real reason for any STUN fallback. Restore it from session_state,
+    # which is rerun-safe, before doing anything else.
+    if diag_key in st.session_state:
+        ICE_SERVER_DIAGNOSTICS.update(st.session_state[diag_key])
+
+    cached = st.session_state.get(cache_key)
+    if cached and (time.time() - cached["fetched_at"]) < ttl_seconds:
+        return cached["servers"]
+
+    cf_key_id, cf_api_token = _get_cloudflare_turn_credentials()
+    ice_servers = None
+    if cf_key_id and cf_api_token:
+        ice_servers = _fetch_cloudflare_ice_servers(cf_key_id, cf_api_token)
+        if ice_servers:
+            ICE_SERVER_DIAGNOSTICS.update(tier="cloudflare", detail="TURN credentials minted OK.")
+    else:
+        ICE_SERVER_DIAGNOSTICS["detail"] = (
+            "CLOUDFLARE_TURN_KEY_ID / CLOUDFLARE_TURN_KEY_API_TOKEN not set "
+            "(checked env vars and st.secrets)."
+        )
+
+    if not ice_servers:
+        metered_key, metered_domain = _get_metered_credentials()
+        if metered_key and metered_domain:
+            ice_servers = _fetch_metered_ice_servers(metered_key, metered_domain)
+            if ice_servers:
+                ICE_SERVER_DIAGNOSTICS.update(tier="metered", detail="TURN credentials fetched OK.")
+
+    if not ice_servers:
+        ICE_SERVER_DIAGNOSTICS["tier"] = "stun-only"
+        ice_servers = STUN_ONLY_ICE_SERVERS
+
+    st.session_state[cache_key] = {"servers": ice_servers, "fetched_at": time.time()}
+    st.session_state[diag_key] = dict(ICE_SERVER_DIAGNOSTICS)
+    return ice_servers
+
+
+def _describe_ice_servers(ice_servers: list) -> str:
+    """Builds the 'Browser camera relay: ...' caption directly from the
+    actual ICE server list this render is using — NOT from the
+    ICE_SERVER_DIAGNOSTICS side-effect dict, which only gets touched
+    inside get_ice_servers()'s body and can look stale ("not yet
+    determined") across the fragment/rerun boundaries this panel sits
+    behind. Deriving the caption straight from the object already in hand
+    can't go stale: it's always describing exactly what this page load's
+    WebRTC connection was configured with.
+    """
+    urls: list = []
+    has_turn_credential = False
+    for server in ice_servers:
+        server_urls = server.get("urls", [])
+        if isinstance(server_urls, str):
+            server_urls = [server_urls]
+        urls.extend(server_urls)
+        if server.get("credential"):
+            has_turn_credential = True
+
+    if any("cloudflare.com" in u for u in urls) and has_turn_credential:
+        return ":material/check_circle: Browser camera relay: Cloudflare TURN configured."
+    if has_turn_credential:
+        return ":material/check_circle: Browser camera relay: TURN relay configured."
+    return (
+        ":material/warning: Browser camera relay: STUN only, no TURN relay configured — "
+        "this is the config most likely to hang at 'Waiting for first frame' on a "
+        "hosted/firewalled network. Check that CLOUDFLARE_TURN_KEY_ID / "
+        "CLOUDFLARE_TURN_KEY_API_TOKEN (or METERED_API_KEY / METERED_DOMAIN) are set "
+        "in this deployment's secrets, and see the last-fetch detail below."
+        + (f" Last-fetch detail: {ICE_SERVER_DIAGNOSTICS['detail']}" if ICE_SERVER_DIAGNOSTICS['detail'] else "")
+    )
+
+
+def render_browser_camera_widget(playing: bool) -> None:
+    """Mounts the WebRTC component ONCE PER PAGE RENDER, unconditionally
+    (same tree position on every run, whether the camera is running or
+    stopped). Toggling `desired_playing_state` — rather than conditionally
+    including/excluding this call — is the documented way to start/stop the
+    stream without remounting it.
+
+    This matters: streamlit-webrtc is a stateful, bidirectional component,
+    so its own connection-state changes trigger extra full-script reruns.
+    If it were only mounted while camera_running (changing the element tree
+    shape between runs), those reruns desync Streamlit's element
+    reconciliation for anything rendered after it in the tree — including
+    the video_placeholder the 0.1s fragment writes into. Symptom: frame/
+    hazard counters keep incrementing (the Python side is fine) but nothing
+    visibly updates until Stop is pressed and a plain, non-fragment render
+    path takes over. Keeping this call unconditional avoids that entirely.
+
+    The native local-preview <video> element is hidden via CSS (our own
+    3x3 grid is the visible feed) — hiding it doesn't stop the underlying
+    track, so frames still reach BrowserCameraProcessor.recv() normally.
+    """
+    if not WEBRTC_AVAILABLE:
+        if playing:
+            st.error(
+                "Browser camera mode requires the `streamlit-webrtc` and `av` packages, "
+                "which are listed in requirements.txt but failed to import. Check the "
+                "deployment logs — this is usually a missing system library (see "
+                "packages.txt: libavformat-dev, libavdevice-dev, libgl1)."
+            )
+        return
+
+    # WebRTC is transport-only. Keep it mounted at one stable location so
+    # its state is not duplicated, but hide its native preview/controls. The
+    # dashboard Start/Stop buttons control `desired_playing_state`, and the
+    # custom 3x3 matrix below is the only visible camera feed.
+    with st.container(key="webrtc_transport"):
+        ctx = webrtc_streamer(
+            key="cybervision-browser-camera",
+            mode=WebRtcMode.SENDONLY,
+            desired_playing_state=playing,
+            rtc_configuration=RTCConfiguration({"iceServers": get_ice_servers()}),
+            media_stream_constraints={"video": True, "audio": False},
+            video_processor_factory=BrowserCameraProcessor,
+            video_html_attrs=VideoHTMLAttributes(
+                autoPlay=True, controls=False, muted=True, style={"display": "none"}
+            ),
+            media_toggle_controls=False,
+            async_processing=True,
+        )
+    st.session_state.webrtc_ctx = ctx
+
+
+# =============================================================================
+# MULTI-CAMERA HANDLING & 3x3 MATRIX (local cv2 devices only)
 # =============================================================================
 @st.cache_resource(show_spinner=False)
 def get_camera_caps() -> Dict[int, cv2.VideoCapture]:
@@ -1024,6 +1503,11 @@ def get_camera_caps() -> Dict[int, cv2.VideoCapture]:
 
 
 def release_camera() -> None:
+    if st.session_state.get("use_webrtc"):
+        # Nothing to release server-side; the browser owns the camera device
+        # and tears its own stream down when the webrtc component unmounts
+        # or permission is revoked.
+        return
     try:
         caps = get_camera_caps()
         for cap in caps.values():
@@ -1044,6 +1528,42 @@ def create_blank_tile(width: int = 320, height: int = 240, label: str = "NO CAME
     cv2.putText(frame, label, (text_x, text_y), font, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
     cv2.rectangle(frame, (0, 0), (width - 1, height - 1), (40, 40, 40), 1)
     return frame
+
+
+def render_frame(placeholder, rgb_array: Optional[np.ndarray]) -> None:
+    """Renders an RGB uint8 frame as an inline base64 data: URI <img>,
+    instead of placeholder.image()'s separate `/media/<hash>` HTTP GET.
+
+    `st.image` doesn't ship the pixels over the same WebSocket connection
+    as everything else on the page — it stores the bytes server-side and
+    tells the browser a *separate* media URL to fetch them from. That
+    extra request is invisible in the Python code and in the rest of the
+    UI, so anything sitting in front of the app that isn't a plain
+    pass-through reverse proxy for *every* path (a Cloudflare Tunnel with
+    only the main app route configured, a corporate proxy, a CDN caching
+    rule, etc.) can silently 404/drop just that one request while the
+    WebSocket-delivered widgets (frame counters, metrics, toasts) keep
+    working perfectly normally. The visible symptom is exactly a broken-
+    image glyph where the video should be, with the rest of the dashboard
+    looking fine — no exception, because Streamlit's own call succeeded;
+    it's the follow-up browser request that never got through.
+
+    Inlining the JPEG bytes as base64 sidesteps this categorically: the
+    frame now travels inside the same markdown payload as any other text
+    on the page, so there is nothing extra left for a proxy to forward.
+    """
+    if rgb_array is None:
+        return
+    bgr = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2BGR)
+    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+    if not ok:
+        placeholder.error("Failed to encode video frame.")
+        return
+    data_uri = "data:image/jpeg;base64," + base64.b64encode(buf).decode("ascii")
+    placeholder.markdown(
+        f'<img src="{data_uri}" style="width:100%;display:block;border-radius:12px;" />',
+        unsafe_allow_html=True,
+    )
 
 
 def construct_3x3_grid(active_frames: Dict[int, np.ndarray], tile_w: int = 320, tile_h: int = 240) -> np.ndarray:
@@ -1069,6 +1589,31 @@ def construct_3x3_grid(active_frames: Dict[int, np.ndarray], tile_w: int = 320, 
 class VideoCaptureManager:
     @staticmethod
     def capture_active_frames() -> Tuple[Dict[int, np.ndarray], Optional[np.ndarray]]:
+        if st.session_state.get("use_webrtc"):
+            return VideoCaptureManager._capture_from_browser()
+        return VideoCaptureManager._capture_from_local_devices()
+
+    @staticmethod
+    def _capture_from_browser() -> Tuple[Dict[int, np.ndarray], Optional[np.ndarray]]:
+        # Only CAM_01 is real here — a browser only exposes the visitor's own
+        # device camera(s), never a bank of 9 independent sources, so the
+        # other grid tiles stay in their "NO CAMERA DETECTED" placeholder
+        # state. Detection still runs off this single live feed.
+        ctx = st.session_state.get("webrtc_ctx")
+        if ctx is None or ctx.video_processor is None:
+            st.session_state.last_error = "Waiting for browser camera permission..."
+            return {}, None
+
+        frame = ctx.video_processor.get_latest_frame()
+        if frame is None:
+            st.session_state.last_error = "Waiting for first frame from browser camera..."
+            return {}, None
+
+        primary_frame = cv2.resize(frame, (CONFIG["FRAME_WIDTH"], CONFIG["FRAME_HEIGHT"]))
+        return {0: frame}, primary_frame
+
+    @staticmethod
+    def _capture_from_local_devices() -> Tuple[Dict[int, np.ndarray], Optional[np.ndarray]]:
         caps = get_camera_caps()
         active_frames = {}
         primary_frame = None
@@ -1548,7 +2093,9 @@ def flush_pending_cloud_uploads() -> None:
         return
 
     try:
-        client = storage.Client()
+        client, _ = get_gcp_clients()
+        if client is None:
+            return
         bucket = client.bucket(CONFIG["GCP_BUCKET"])
     except Exception:
         return
@@ -1619,7 +2166,10 @@ def upload_to_google_cloud_async(frame: np.ndarray, alert: Dict[str, Any]) -> No
             if not ok:
                 return
 
-            client = storage.Client()
+            client, _ = get_gcp_clients()
+            if client is None:
+                _queue_image_for_later_upload(frame, alert)
+                return
             bucket = client.bucket(CONFIG["GCP_BUCKET"])
 
             image_blob = bucket.blob(image_name)
@@ -1951,6 +2501,20 @@ def render_dashboard_settings_panel() -> None:
             value=st.session_state.cloud_sync_enabled,
         )
 
+        if st.session_state.cloud_sync_enabled:
+            if not GCP_AVAILABLE:
+                st.caption(":material/error: `google-cloud-firestore` / `google-cloud-storage` not installed.")
+            elif CONFIG["GCP_BUCKET"] == "your-gcp-bucket-name":
+                st.caption(":material/warning: Set CONFIG[\"GCP_BUCKET\"] / GCP_PROJECT_ID in main.py.")
+            elif _get_gcp_service_account_info() is None:
+                st.caption(":material/warning: No GCP credentials found (secrets, env var, or key file).")
+            else:
+                st.caption(":material/check_circle: GCP credentials loaded.")
+
+        if st.session_state.get("use_webrtc"):
+            ice_servers = get_ice_servers()
+            st.caption(_describe_ice_servers(ice_servers))
+
         timeout_option = st.selectbox(
             "Inference timeout target",
             ["1.0s", "2.0s", "3.0s", "5.0s"],
@@ -2026,8 +2590,9 @@ def _render_live_stats_body() -> None:
     # Confidence below already reads and that actually drives the hazard
     # toast/siren in run_detection_pipeline(). This used to read
     # yolo_severity alone, so a hazard caught by YARA/VLM/visual analysis
-    # but missed by YOLO's own bounding-box detector would fire the "FIRE
-    # DETECTED" toast while this card still said NORMAL.
+    # but missed by YOLO's own bounding-box detector (e.g. fire shown on a
+    # phone screen rather than real flame) would fire the "FIRE DETECTED"
+    # toast while this card still said NORMAL.
     severity = str(latest.get("severity", "NORMAL")).upper()
     if severity not in SEVERITY_STYLE:
         severity = "NORMAL"
@@ -2102,11 +2667,11 @@ def render_video_frame(video_placeholder, status_placeholder) -> None:
 
     if not st.session_state.get("camera_running", False):
         if st.session_state.get("last_frame_rgb") is not None:
-            video_placeholder.image(st.session_state.last_frame_rgb, use_container_width=True)
+            render_frame(video_placeholder, st.session_state.last_frame_rgb)
         else:
-            video_placeholder.image(
+            render_frame(
+                video_placeholder,
                 VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
-                use_container_width=True,
             )
         status_placeholder.info("Camera is stopped. Detection paused.")
         return
@@ -2114,7 +2679,7 @@ def render_video_frame(video_placeholder, status_placeholder) -> None:
     active_frames, primary_frame = VideoCaptureManager.capture_active_frames()
 
     if primary_frame is None and not active_frames:
-        status_placeholder.error("Camera unavailable.")
+        status_placeholder.error(st.session_state.get("last_error") or "Camera unavailable.")
         return
 
     current_time = time.time()
@@ -2154,7 +2719,7 @@ def render_video_frame(video_placeholder, status_placeholder) -> None:
     grid_rgb = cv2.cvtColor(grid_matrix, cv2.COLOR_BGR2RGB)
     st.session_state.last_frame_rgb = grid_rgb
 
-    video_placeholder.image(grid_rgb, channels="RGB", use_container_width=True)
+    render_frame(video_placeholder, grid_rgb)
 
     if not YOLO_AVAILABLE:
         status_placeholder.warning("Ultralytics is not installed.")
@@ -2199,18 +2764,46 @@ def render_video_feed() -> None:
             release_camera()
             st.rerun()
 
+    if st.session_state.get("webrtc_unavailable_on_cloud"):
+        st.error(
+            "This deployment has no local camera device, and the browser-camera "
+            "(streamlit-webrtc) packages failed to load — see the deployment logs. "
+            "Detection cannot start until that's fixed."
+        )
+
+    # Mount the browser-camera transport at one stable tree position.
+    # The dashboard Start button is the only user-facing camera control.
+    if st.session_state.get("use_webrtc"):
+        render_browser_camera_widget(playing=st.session_state.camera_running)
+
     video_placeholder = st.empty()
     status_placeholder = st.empty()
 
+    # Both placeholders must be WRITTEN TO at least once during this normal
+    # (non-fragment) run before live_camera_fragment below can claim a
+    # stable position in them for its own repeated writes — st.empty() only
+    # reserves a layout slot, it doesn't count as a write. Skipping this
+    # write whenever camera_running was already True (e.g. right after
+    # Start) is what raised StreamlitInvalidLayoutContextError: "container
+    # was not written to during the initial run". So render an initial
+    # frame/status unconditionally, for both the stopped and the
+    # just-started case, before deciding whether to hand the placeholders
+    # off to the fragment.
+    if st.session_state.get("last_frame_rgb") is not None:
+        render_frame(video_placeholder, st.session_state.last_frame_rgb)
+    else:
+        render_frame(
+            video_placeholder,
+            VideoCaptureManager.placeholder_frame(
+                "Starting camera..." if st.session_state.camera_running else "Camera Stopped",
+                "Connecting to feed..." if st.session_state.camera_running else "Click Start to begin monitoring.",
+            ),
+        )
+    status_placeholder.info(
+        "Starting camera..." if st.session_state.camera_running else "Camera is stopped. Detection paused."
+    )
+
     if not st.session_state.camera_running:
-        if st.session_state.get("last_frame_rgb") is not None:
-            video_placeholder.image(st.session_state.last_frame_rgb, use_container_width=True)
-        else:
-            video_placeholder.image(
-                VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
-                use_container_width=True,
-            )
-        status_placeholder.info("Camera is stopped. Detection paused.")
         return
 
     live_camera_fragment(video_placeholder, status_placeholder)
