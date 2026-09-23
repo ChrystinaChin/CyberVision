@@ -268,6 +268,7 @@ def init_session_state() -> None:
         "active_hazard_toast": None,
         "active_page": "Dashboard",
         "webrtc_ctx": None,
+        "_frame_processing_busy": False,
     }
 
     for key, value in defaults.items():
@@ -301,14 +302,20 @@ def inject_custom_css() -> None:
             color: {text} !important;
         }}
 
-        /* PREVENT FRAGMENT DIMMING / FADING OUT ON UPDATE */
+        /* PREVENT FRAGMENT DIMMING / FADING OUT ON UPDATE (stops the live
+           camera image from blinking/disappearing between fragment reruns) */
         div[data-testid="stFragment"],
         [data-testid="stFragment"] > div,
         div[data-testid="stElementContainer"],
-        [data-stale="true"] {{
+        div[data-testid="stImage"],
+        div[data-testid="stImage"] img,
+        [data-stale="true"],
+        [data-stale="true"] * {{
             opacity: 1 !important;
+            visibility: visible !important;
             transition: none !important;
             filter: none !important;
+            animation: none !important;
         }}
 
         .main .block-container {{
@@ -2274,12 +2281,6 @@ def render_dashboard_settings_panel() -> None:
             else:
                 st.caption(":material/check_circle: GCP credentials loaded.")
 
-        if st.session_state.get("use_webrtc"):
-            ice_servers = get_ice_servers()
-            desc = _describe_ice_servers(ice_servers)
-            if desc:
-                st.caption(desc)
-
         timeout_option = st.selectbox(
             "Inference timeout target",
             ["1.0s", "2.0s", "3.0s", "5.0s"],
@@ -2414,53 +2415,67 @@ def render_resource_trend_preview() -> None:
 # =============================================================================
 # LIVE VIDEO STREAM (FULL-WIDTH 3x3 MATRIX)
 # =============================================================================
-@st.fragment(run_every=0.1)
+@st.fragment(run_every=0.5)
 def live_camera_fragment(video_placeholder) -> None:
     render_custom_hazard_toast()
 
     if not st.session_state.get("camera_running", False):
         return
 
-    active_frames, primary_frame = VideoCaptureManager.capture_active_frames()
-
-    if primary_frame is None and not active_frames:
-        st.error(st.session_state.get("last_error") or "Camera unavailable.")
+    # Detection (YOLO/VLM/YARA) can take several seconds per frame. The
+    # fragment timer above still fires every 0.5s regardless, and if a new
+    # tick starts work while the previous one is still running, Streamlit
+    # tears down and rebuilds the fragment mid-flight — that's what made the
+    # feed flash on and off. This guard makes a busy tick a cheap no-op
+    # instead, so the last successfully drawn frame just stays on screen
+    # until the next one is ready.
+    if st.session_state.get("_frame_processing_busy"):
         return
 
-    current_time = time.time()
-    last_time = st.session_state.get("last_frame_time", current_time)
-    fps = 1 / max(current_time - last_time, 0.001)
+    st.session_state._frame_processing_busy = True
+    try:
+        active_frames, primary_frame = VideoCaptureManager.capture_active_frames()
 
-    st.session_state.fps = fps
-    st.session_state.last_frame_time = current_time
-    st.session_state.frames_processed += 1
+        if primary_frame is None and not active_frames:
+            st.error(st.session_state.get("last_error") or "Camera unavailable.")
+            return
 
-    pipeline_result = run_detection_pipeline(primary_frame)
+        current_time = time.time()
+        last_time = st.session_state.get("last_frame_time", current_time)
+        fps = 1 / max(current_time - last_time, 0.001)
 
-    if 0 in active_frames and pipeline_result.get("annotated_frame") is not None:
-        active_frames[0] = pipeline_result["annotated_frame"]
+        st.session_state.fps = fps
+        st.session_state.last_frame_time = current_time
+        st.session_state.frames_processed += 1
 
-    grid_matrix = construct_3x3_grid(active_frames)
+        pipeline_result = run_detection_pipeline(primary_frame)
 
-    severity = st.session_state.get("yolo_severity", "NORMAL")
-    yolo_result = pipeline_result.get("yolo", {})
-    yolo_status = "DETECTED" if yolo_result.get("detected") else "CLEAR"
+        if 0 in active_frames and pipeline_result.get("annotated_frame") is not None:
+            active_frames[0] = pipeline_result["annotated_frame"]
 
-    hud_line_1 = f"FPS: {fps:.1f} | YOLO: {yolo_status}"
-    hud_line_2 = f"INF: {st.session_state.get('inference_count', 0)} | STATUS: {severity}"
+        grid_matrix = construct_3x3_grid(active_frames)
 
-    overlay = grid_matrix.copy()
-    cv2.rectangle(overlay, (10, 10), (430, 82), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.50, grid_matrix, 0.50, 0, grid_matrix)
+        severity = st.session_state.get("yolo_severity", "NORMAL")
+        yolo_result = pipeline_result.get("yolo", {})
+        yolo_status = "DETECTED" if yolo_result.get("detected") else "CLEAR"
 
-    cv2.putText(grid_matrix, hud_line_1, (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
-    cv2.putText(grid_matrix, hud_line_2, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
+        hud_line_1 = f"FPS: {fps:.1f} | YOLO: {yolo_status}"
+        hud_line_2 = f"INF: {st.session_state.get('inference_count', 0)} | STATUS: {severity}"
 
-    grid_rgb = cv2.cvtColor(grid_matrix, cv2.COLOR_BGR2RGB)
-    st.session_state.last_frame_rgb = grid_rgb
+        overlay = grid_matrix.copy()
+        cv2.rectangle(overlay, (10, 10), (430, 82), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.50, grid_matrix, 0.50, 0, grid_matrix)
 
-    # Smooth persistent container update avoids widget flickering/stutter
-    video_placeholder.image(grid_rgb, channels="RGB", use_container_width=True)
+        cv2.putText(grid_matrix, hud_line_1, (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
+        cv2.putText(grid_matrix, hud_line_2, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
+
+        grid_rgb = cv2.cvtColor(grid_matrix, cv2.COLOR_BGR2RGB)
+        st.session_state.last_frame_rgb = grid_rgb
+
+        # Smooth persistent container update avoids widget flickering/stutter
+        video_placeholder.image(grid_rgb, channels="RGB", use_container_width=True)
+    finally:
+        st.session_state._frame_processing_busy = False
 
 
 def render_video_feed() -> None:
