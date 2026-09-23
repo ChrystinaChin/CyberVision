@@ -1224,19 +1224,6 @@ def _describe_ice_servers(ice_servers: list) -> str:
         if server.get("credential"):
             has_turn_credential = True
 
-    if any("cloudflare.com" in u for u in urls) and has_turn_credential:
-        return ":material/check_circle: Browser camera relay: Cloudflare TURN configured."
-    if has_turn_credential:
-        return ":material/check_circle: Browser camera relay: TURN relay configured."
-    return (
-        ":material/warning: Browser camera relay: STUN only, no TURN relay configured — "
-        "this is the config most likely to hang at 'Waiting for first frame' on a "
-        "hosted/firewalled network. Check that CLOUDFLARE_TURN_KEY_ID / "
-        "CLOUDFLARE_TURN_KEY_API_TOKEN (or METERED_API_KEY / METERED_DOMAIN) are set "
-        "in this deployment's secrets, and see the last-fetch detail below."
-        + (f" Last-fetch detail: {ICE_SERVER_DIAGNOSTICS['detail']}" if ICE_SERVER_DIAGNOSTICS['detail'] else "")
-    )
-
 
 def render_browser_camera_widget(playing: bool) -> None:
     if not WEBRTC_AVAILABLE:
