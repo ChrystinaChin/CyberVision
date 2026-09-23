@@ -13,3 +13,4 @@ streamlit-webrtc>=0.47.9
 av>=11.0.0
 requests>=2.31.0
 ultralytics>=8.4.47
+dill
