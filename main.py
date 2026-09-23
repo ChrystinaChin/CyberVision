@@ -2585,9 +2585,15 @@ def render_dashboard_header() -> None:
 def _render_live_stats_body() -> None:
     latest = st.session_state.get("latest_detection") or {}
 
-    # Severity mirrors the YOLO severity (fire/smoke rules in
-    # YOLOFireSmokeDetector.hazard_severity), not the blended YARA/VLM one.
-    severity = str(st.session_state.get("yolo_severity", "NORMAL")).upper()
+    # Mirror the SAME blended severity (YOLO + visual/YARA/VLM, whichever
+    # scores highest — see YARAVerifier.verify()'s final_severity) that
+    # Confidence below already reads and that actually drives the hazard
+    # toast/siren in run_detection_pipeline(). This used to read
+    # yolo_severity alone, so a hazard caught by YARA/VLM/visual analysis
+    # but missed by YOLO's own bounding-box detector (e.g. fire shown on a
+    # phone screen rather than real flame) would fire the "FIRE DETECTED"
+    # toast while this card still said NORMAL.
+    severity = str(latest.get("severity", "NORMAL")).upper()
     if severity not in SEVERITY_STYLE:
         severity = "NORMAL"
 
@@ -2691,7 +2697,11 @@ def render_video_frame(video_placeholder, status_placeholder) -> None:
 
     grid_matrix = construct_3x3_grid(active_frames)
 
-    severity = st.session_state.get("yolo_severity", "NORMAL")
+    # Same blended severity as the Active Monitoring card (see
+    # _render_live_stats_body) — NOT yolo_severity alone — so the on-frame
+    # "STATUS:" text can't say NORMAL while a hazard toast is firing off a
+    # YARA/VLM/visual detection YOLO's own model missed.
+    severity = pipeline_result.get("alert", {}).get("severity", "NORMAL")
 
     yolo_result = pipeline_result.get("yolo", {})
     yolo_status = "DETECTED" if yolo_result.get("detected") else "CLEAR"
