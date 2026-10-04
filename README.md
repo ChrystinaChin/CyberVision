@@ -1,7 +1,7 @@
 # CyberVision: Adaptive Context Optimization at the Edge
 ---
 
-## 📌 Overview
+## Overview
 
 Uncontrolled fire and smoke incidents pose severe risks to human life, natural ecosystems, and infrastructure[cite: 8]. Traditional point-detector physical sensors struggle in high-ceiling or outdoor environments due to delayed response times and lack of spatial awareness[cite: 8]. While computer vision systems using object detection models like YOLO offer real-time detection[cite: 8], standalone deployments on resource-constrained edge devices face two major hurdles[cite: 8]:
 1. **High False-Positive Rates:** Flame-like objects (e.g., skin tones, red clothing, warm lighting) trigger frequent false alarms[cite: 8].
@@ -11,7 +11,7 @@ Uncontrolled fire and smoke incidents pose severe risks to human life, natural e
 
 ---
 
-## ✨ Key Features & Technical Architecture
+## Key Features & Technical Architecture
 
 ### 1. Primary Bounding Box Detection (YOLO)
 - Fine-tuned **YOLO** model targeting two primary classes: `fire` and `smoke`[cite: 9].
@@ -42,9 +42,8 @@ Uncontrolled fire and smoke incidents pose severe risks to human life, natural e
 
 ---
 
-## 🏗️ System Pipeline Flow
+## System Pipeline Flow
 
-```text
 +--------------------------------------------------------+
 |                   INPUT CAMERA FEED                    |
 |             (3x3 Grid Matrix / Single Stream)          |
@@ -83,11 +82,10 @@ Uncontrolled fire and smoke incidents pose severe risks to human life, natural e
 |             ALERT & FORENSIC SYNC ENGINE               |
 |      Local SQLite Buffer -> Audio Alert -> GCP Cloud   |
 +--------------------------------------------------------+
-```[cite: 9]
 
 ---
 
-## 📊 Performance Benchmarks
+## Performance Benchmarks
 
 Evaluated on an Intel Core i7 edge testbed (16 GB RAM) operating on CPU execution bounds without dedicated discrete GPU acceleration[cite: 11, 12]:
 
@@ -102,7 +100,7 @@ Evaluated on an Intel Core i7 edge testbed (16 GB RAM) operating on CPU executio
 
 ---
 
-## 🛠️ Prerequisites & Installation
+## Prerequisites & Installation
 
 ### Core Requirements
 - **Python 3.8+**
