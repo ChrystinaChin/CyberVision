@@ -13,7 +13,7 @@ Uncontrolled fire and smoke incidents pose severe risks to human life, natural e
 
 ---
 
-## 📸 Live Detection Samples
+## Live Detection Samples
 
 | Active Combustion | Wildfire & Smoke Plumes | Early Smoke Detection |
 | :---: | :---: | :---: |
@@ -21,7 +21,7 @@ Uncontrolled fire and smoke incidents pose severe risks to human life, natural e
 
 ---
 
-## ✨ Key Features & Technical Architecture
+## Key Features & Technical Architecture
 
 ### 1. Primary Bounding Box Detection (YOLO)
 - Fine-tuned **YOLO** model targeting two primary classes: `fire` and `smoke`.
@@ -52,7 +52,7 @@ Uncontrolled fire and smoke incidents pose severe risks to human life, natural e
 
 ---
 
-## 🛠️ System Pipeline Flow
+## System Pipeline Flow
 
 ```text
 +--------------------------------------------------------+
