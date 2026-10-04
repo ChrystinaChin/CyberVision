@@ -93,3 +93,51 @@ Uncontrolled fire and smoke incidents pose severe risks to human life, natural e
 |             ALERT & FORENSIC SYNC ENGINE               |
 |      Local SQLite Buffer -> Audio Alert -> GCP Cloud   |
 +--------------------------------------------------------+
+```
+
+## Prerequisites & Installation
+
+
+
+### Core Requirements
+
+- **Python 3.8+**
+
+- **OpenCV (`opencv-python`)**
+
+- **PyTorch**
+
+- **YOLO (Ultralytics)**
+
+- **Moondream VLM**
+
+- **YARA (`yara-python`)**
+
+- **psutil**
+
+- **Google Cloud SDK (`google-cloud-firestore`, `google-cloud-storage`)**
+
+
+
+### Setup
+
+```bash
+
+# Clone the repository
+
+git clone [https://github.com/ChrystinaChin/Computer-Vision.git](https://github.com/ChrystinaChin/Computer-Vision.git)
+
+cd Computer-Vision
+
+
+
+# Install dependencies
+
+pip install -r requirements.txt
+
+
+
+# Run CyberVision
+
+python main.py 
+
