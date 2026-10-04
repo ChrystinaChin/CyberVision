@@ -4,7 +4,12 @@
 ## Overview
 
 Uncontrolled fire and smoke incidents pose severe risks to human life, natural ecosystems, and infrastructure[cite: 8]. Traditional point-detector physical sensors struggle in high-ceiling or outdoor environments due to delayed response times and lack of spatial awareness[cite: 8]. While computer vision systems using object detection models like YOLO offer real-time detection[cite: 8], standalone deployments on resource-constrained edge devices face two major hurdles[cite: 8]:
-<img width="610" height="177" alt="image" src="https://github.com/user-attachments/assets/ff820fd8-f2cf-4ae6-a93a-da98550b0115" />
+| Active Combustion | Wildfire & Smoke Plumes | Early Smoke Detection |
+| :---: | :---: | :---: |
+| <img src="<img width="197" height="143" alt="image" src="https://github.com/user-attachments/assets/fa41c485-10b3-4571-a52f-77a7dac4fc3c" />
+" width="230" alt="Primary combustion detection" /> | <img src="<img width="194" height="143" alt="image" src="https://github.com/user-attachments/assets/018955ef-efee-4d4f-b987-eaea51a4c1c6" />
+" width="230" alt="Multi-class wildfire detection" /> | <img src="<img width="188" height="140" alt="image" src="https://github.com/user-attachments/assets/cc02d218-29c4-4fcf-a462-0882d7d2f5e2" />
+" width="230" alt="Early-stage smoke detection" /> |
 
 1. **High False-Positive Rates:** Flame-like objects (e.g., skin tones, red clothing, warm lighting) trigger frequent false alarms[cite: 8].
 2. **Resource Exhaustion on Edge Hardware:** Heavy multi-modal pipelines running alongside Vision-Language Models (VLMs) cause high CPU/RAM load, frame dropping, and system instability[cite: 8].
