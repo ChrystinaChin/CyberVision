@@ -43,7 +43,7 @@ Uncontrolled fire and smoke incidents pose severe risks to human life, natural e
 ---
 
 ## System Pipeline Flow
-
+```text
 +--------------------------------------------------------+
 |                   INPUT CAMERA FEED                    |
 |             (3x3 Grid Matrix / Single Stream)          |
@@ -82,22 +82,7 @@ Uncontrolled fire and smoke incidents pose severe risks to human life, natural e
 |             ALERT & FORENSIC SYNC ENGINE               |
 |      Local SQLite Buffer -> Audio Alert -> GCP Cloud   |
 +--------------------------------------------------------+
-
----
-
-## Performance Benchmarks
-
-Evaluated on an Intel Core i7 edge testbed (16 GB RAM) operating on CPU execution bounds without dedicated discrete GPU acceleration[cite: 11, 12]:
-
-| Configuration | Precision (%) | Recall (%) | False Positive Rate (FPR) | Avg Latency (ms) |
-| :--- | :---: | :---: | :---: | :---: |
-| **Standalone Visual Fallback (HSV/YCrCb)** | 68.4% | 88.2% | 24.1% | **18 ms** |
-| **Standalone Object Detector (YOLO)** | 89.1% | 92.5% | 8.6% | 42 ms |
-| **Unconstrained Multi-Modal Engine** | 92.3% | **94.1%** | 5.2% | 310 ms |
-| **CyberVision (Full Adaptive Pipeline)** | **96.8%** | 93.6% | **1.2%** | **185 ms** |
-
-*CyberVision achieves the lowest False Positive Rate (1.2%) while maintaining real-time execution limits (185 ms avg latency) under high edge processing loads[cite: 13].*
-
+```
 ---
 
 ## Prerequisites & Installation
