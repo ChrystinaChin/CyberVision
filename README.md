@@ -4,6 +4,8 @@
 ## Overview
 
 Uncontrolled fire and smoke incidents pose severe risks to human life, natural ecosystems, and infrastructure[cite: 8]. Traditional point-detector physical sensors struggle in high-ceiling or outdoor environments due to delayed response times and lack of spatial awareness[cite: 8]. While computer vision systems using object detection models like YOLO offer real-time detection[cite: 8], standalone deployments on resource-constrained edge devices face two major hurdles[cite: 8]:
+<img width="610" height="177" alt="image" src="https://github.com/user-attachments/assets/ff820fd8-f2cf-4ae6-a93a-da98550b0115" />
+
 1. **High False-Positive Rates:** Flame-like objects (e.g., skin tones, red clothing, warm lighting) trigger frequent false alarms[cite: 8].
 2. **Resource Exhaustion on Edge Hardware:** Heavy multi-modal pipelines running alongside Vision-Language Models (VLMs) cause high CPU/RAM load, frame dropping, and system instability[cite: 8].
 
